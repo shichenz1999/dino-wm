@@ -127,21 +127,21 @@ class PlanEvaluator:  # evaluator for planning
             i_z_obs=i_final_z_obs,
         )
 
-        # plot trajs
-        if self.wm.decoder is not None:
-            i_visuals = self.wm.decode_obs(i_z_obses)[0]["visual"]
-            i_visuals = self._mask_traj(
-                i_visuals, action_len + 1
-            )  # we have action_len + 1 states
-            e_visuals = self.preprocessor.transform_obs_visual(e_visuals)
-            e_visuals = self._mask_traj(e_visuals, action_len * self.frameskip + 1)
-            self._plot_rollout_compare(
-                e_visuals=e_visuals,
-                i_visuals=i_visuals,
-                successes=successes,
-                save_video=save_video,
-                filename=filename,
-            )
+        # plot trajs (legacy visualization disabled; use scripts/visualize_plan.py instead)
+        # if self.wm.decoder is not None:
+        #     i_visuals = self.wm.decode_obs(i_z_obses)[0]["visual"]
+        #     i_visuals = self._mask_traj(
+        #         i_visuals, action_len + 1
+        #     )  # we have action_len + 1 states
+        #     e_visuals = self.preprocessor.transform_obs_visual(e_visuals)
+        #     e_visuals = self._mask_traj(e_visuals, action_len * self.frameskip + 1)
+        #     self._plot_rollout_compare(
+        #         e_visuals=e_visuals,
+        #         i_visuals=i_visuals,
+        #         successes=successes,
+        #         save_video=save_video,
+        #         filename=filename,
+        #     )
 
         return logs, successes, e_obses, e_states
 

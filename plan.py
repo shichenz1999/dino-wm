@@ -1,6 +1,8 @@
 import os
+import time
 import gym
 import json
+from datetime import datetime
 import hydra
 import random
 import torch
@@ -19,7 +21,7 @@ from env.venv import SubprocVectorEnv
 from custom_resolvers import replace_slash
 from preprocessor import Preprocessor
 from planning.evaluator import PlanEvaluator
-from utils import cfg_to_dict, seed
+from utils import cfg_to_dict, seed, move_to_device
 
 warnings.filterwarnings("ignore")
 log = logging.getLogger(__name__)
@@ -127,6 +129,9 @@ class PlanWorkspace:
         self.frameskip = frameskip
         self.wandb_run = wandb_run
         self.device = next(wm.parameters()).device
+        # Wall-clock timing of the full planning run
+        self._t0 = time.time()
+        self._start_iso = datetime.now().isoformat(timespec="seconds")
 
         # have different seeds for each planning instances
         self.eval_seed = [cfg_dict["seed"] * n + 1 for n in range(cfg_dict["n_evals"])]
@@ -194,8 +199,6 @@ class PlanWorkspace:
             self.planner.n_taken_actions = cfg_dict["goal_H"]
         else:
             self.planner.horizon = cfg_dict["goal_H"]
-
-        self.dump_targets()
 
     def prepare_targets(self):
         states = []
@@ -306,21 +309,170 @@ class PlanWorkspace:
         self.gt_actions = data["gt_actions"]
         self.goal_H = data["goal_H"]
 
-    def dump_targets(self):
-        with open("plan_targets.pkl", "wb") as f:
-            pickle.dump(
-                {
-                    "obs_0": self.obs_0,
-                    "obs_g": self.obs_g,
-                    "state_0": self.state_0,
-                    "state_g": self.state_g,
-                    "gt_actions": self.gt_actions,
-                    "goal_H": self.goal_H,
-                },
-                f,
+    def _wm_decode_uint8(self, z):
+        """WM decode → uint8 frames. Decoder outputs in [-1, 1], we map to [0, 255]."""
+        visuals = self.wm.decode_obs(z)[0]["visual"]
+        return (((visuals.clamp(-1, 1) + 1) / 2) * 255).cpu().numpy().astype(np.uint8)
+
+    def _generate_wm_visuals(self, actions, e_obses):
+        """
+        Generate WM visualization frames for plan_visuals.pkl.
+
+        For MPC: rollout WM separately per iter, using the real env obs at iter
+        start (extracted from e_obses). Mirrors MPC's true predictions — iter k
+        starts from the env state that resulted from executing actions through
+        iter k-1.
+        For non-MPC (open-loop CEM/GD): single rollout from initial state.
+
+        Returns dict with keys: wm_obs_0_recon, wm_obs_g_recon, wm_imagined.
+        """
+        n_taken = getattr(self.planner, "n_taken_actions", None)
+        # Side effect: save iter-end latents (last frame of each iter's rollout)
+        # so the evals.json metric loop can compute env-vs-imagined divergence
+        # without re-running WM.
+        self._iter_end_latents = []
+
+        with torch.no_grad():
+            if n_taken:
+                # MPC path: per-iter rollout. Each iter starts from the real env
+                # state at its starting frame (index k * n_taken * frameskip in e_obses).
+                n_iters = actions.shape[1] // n_taken
+                per_iter_uint8 = []
+                for k in range(n_iters):
+                    start_idx = k * n_taken * self.frameskip
+                    iter_obs = {
+                        key: arr[:, start_idx : start_idx + 1]
+                        for key, arr in e_obses.items()
+                    }
+                    iter_acts = actions[:, k * n_taken : (k + 1) * n_taken].detach()
+                    trans_iter_obs = move_to_device(
+                        self.data_preprocessor.transform_obs(iter_obs),
+                        self.evaluator.device,
+                    )
+                    iter_z, _ = self.wm.rollout(obs_0=trans_iter_obs, act=iter_acts)
+                    per_iter_uint8.append(self._wm_decode_uint8(iter_z))
+                    # Save the iter-end imagined latent (last timestep), keeping
+                    # the dict-of-tensors structure that wm.encode_obs also returns.
+                    self._iter_end_latents.append({
+                        key: arr[:, -1:].detach() for key, arr in iter_z.items()
+                    })
+                # iter 0 frame 0 = obs_0 recon; concat all iters' frames 1+ as imaginations
+                wm_obs_0_recon = per_iter_uint8[0][:, 0:1]
+                wm_imagined = np.concatenate(
+                    [v[:, 1:] for v in per_iter_uint8], axis=1
+                )
+            else:
+                # Open-loop fallback: single rollout from initial state
+                trans_obs_0 = move_to_device(
+                    self.data_preprocessor.transform_obs(self.obs_0),
+                    self.evaluator.device,
+                )
+                full_z, _ = self.wm.rollout(obs_0=trans_obs_0, act=actions.detach())
+                full_uint8 = self._wm_decode_uint8(full_z)
+                wm_obs_0_recon = full_uint8[:, 0:1]
+                wm_imagined = full_uint8[:, 1:]
+                # Single "iter" — save the final latent so the metric loop works
+                self._iter_end_latents.append({
+                    key: arr[:, -1:].detach() for key, arr in full_z.items()
+                })
+
+            # Goal reconstruction (same for both paths)
+            trans_obs_g = move_to_device(
+                self.data_preprocessor.transform_obs(self.obs_g),
+                self.evaluator.device,
             )
-        file_path = os.path.abspath("plan_targets.pkl")
-        print(f"Dumped plan targets to {file_path}")
+            z_obs_g = self.wm.encode_obs(trans_obs_g)
+            wm_obs_g_recon = self._wm_decode_uint8(z_obs_g)
+
+        return {
+            "wm_obs_0_recon": wm_obs_0_recon,
+            "wm_obs_g_recon": wm_obs_g_recon,
+            "wm_imagined":    wm_imagined,
+        }
+
+    def _per_iter_metrics(self, k, n_taken, action_len_int, e_obses, e_states):
+        """Compute the 8 per-eval metrics at iter k (1-indexed at k+1).
+
+        Per-eval cutoff = min(action_len[i], (k+1)*n_taken) — already-succeeded
+        trajs are evaluated at their success moment, matching logs.json semantics.
+        """
+        n = self.n_evals
+        cutoff_step = np.minimum(action_len_int, (k + 1) * n_taken)
+        end_step = np.minimum(cutoff_step * self.frameskip, e_states.shape[1] - 1)
+        iter_idx = np.minimum(
+            np.maximum(np.ceil(cutoff_step / n_taken).astype(int) - 1, 0), k
+        )
+        ii = np.arange(n)
+
+        metrics = dict(self.env.eval_state(self.state_g, e_states[ii, end_step]))
+
+        # Observation-level (int32 cast avoids uint8 wrap-around).
+        v_now = e_obses["visual"][ii, end_step].reshape(n, -1).astype(np.int32)
+        v_goal = self.obs_g["visual"][:, 0].reshape(n, -1).astype(np.int32)
+        metrics["visual_dist"] = np.linalg.norm(v_now - v_goal, axis=-1)
+        metrics["proprio_dist"] = np.linalg.norm(
+            e_obses["proprio"][ii, end_step] - self.obs_g["proprio"][:, 0], axis=-1
+        )
+
+        # WM latent divergence per-eval.
+        cur_obs = {key: arr[ii, end_step][:, None] for key, arr in e_obses.items()}
+        trans_cur = move_to_device(
+            self.data_preprocessor.transform_obs(cur_obs), self.evaluator.device
+        )
+        with torch.no_grad():
+            env_z = self.wm.encode_obs(trans_cur)
+        imagined_z = {
+            key: torch.stack(
+                [self._iter_end_latents[int(iter_idx[i])][key][i, 0] for i in range(n)]
+            ).unsqueeze(1)
+            for key in self._iter_end_latents[0].keys()
+        }
+        for key in ("visual", "proprio"):
+            diff = env_z[key] - imagined_z[key]
+            metrics[f"div_{key}_emb"] = diff.flatten(1).norm(dim=1).cpu().numpy()
+        return metrics
+
+    def _compute_evals_json(self, actions, e_obses, e_states, action_len, successes):
+        """Build the {evals, per_iter, final} payload for evals.json."""
+        n_taken = getattr(self.planner, "n_taken_actions", None) or int(actions.shape[1])
+        n_taken = int(n_taken)
+        action_len_int = action_len.astype(int)
+        max_iters = max(1, int(np.ceil(action_len.max() / n_taken)))
+
+        per_iter_raw = [
+            self._per_iter_metrics(k, n_taken, action_len_int, e_obses, e_states)
+            for k in range(max_iters)
+        ]
+
+        def _format_val(key, v):
+            return bool(v) if key == "success" else round(float(v), 3)
+
+        evals = {}
+        for i in range(self.n_evals):
+            n_iters_i = max(1, int(np.ceil(action_len_int[i] / n_taken)))
+            iters = [
+                {"iter": k + 1, **{key: _format_val(key, m[key][i]) for key in m}}
+                for k, m in enumerate(per_iter_raw[:n_iters_i])
+            ]
+            evals[str(i)] = {
+                "success":    bool(successes[i]),
+                "action_len": int(action_len[i]),
+                "iters":      iters,
+            }
+
+        def _mean_key(key):
+            return "success_rate" if key == "success" else f"mean_{key}"
+
+        per_iter = [
+            {
+                "iter": k + 1,
+                **{_mean_key(key): round(float(np.asarray(m[key]).astype(float).mean()), 3)
+                   for key in m},
+            }
+            for k, m in enumerate(per_iter_raw)
+        ]
+        final = {k: v for k, v in per_iter[-1].items() if k != "iter"}
+        return {"evals": evals, "per_iter": per_iter, "final": final}
 
     def perform_planning(self):
         if self.debug_dset_init:
@@ -332,9 +484,60 @@ class PlanWorkspace:
             obs_g=self.obs_g,
             actions=actions_init,
         )
-        logs, successes, _, _ = self.evaluator.eval_actions(
+        action_len = np.where(np.isfinite(action_len), action_len, actions.shape[1])
+        logs, successes, e_obses, e_states = self.evaluator.eval_actions(
             actions.detach(), action_len, save_video=True, filename="output_final"
         )
+
+        # === plan_meta.pkl: per-trajectory data + algorithm results (~KB) ===
+        with open("plan_meta.pkl", "wb") as f:
+            pickle.dump(
+                {
+                    # task (per-traj, state-level)
+                    "state_0":    self.state_0,                               # (n, state_dim)
+                    "state_g":    self.state_g,                               # (n, state_dim)
+                    "gt_actions": self.gt_actions,                            # (n, T, ...) | None
+                    # algorithm output (per-traj)
+                    "actions":    actions.detach().cpu().numpy(),             # (n, T, action_dim)
+                    "action_len": action_len,                                 # (n,) int, steps executed
+                    "successes":  np.asarray(successes),                      # (n,) bool, reached goal
+                    "e_states":   e_states,                                   # (n, T*frameskip+1, state_dim)
+                },
+                f,
+            )
+        print(f"Dumped plan meta to {os.path.abspath('plan_meta.pkl')}")
+
+        # === plan_visuals.pkl: per-trajectory pixel data (~MB) ===
+        viz = self._generate_wm_visuals(actions, e_obses)
+        with open("plan_visuals.pkl", "wb") as f:
+            pickle.dump(
+                {
+                    # real env (MuJoCo)
+                    "obs_g":      self.obs_g["visual"],                       # (n, 1, H, W, 3) uint8
+                    "env_frames": e_obses["visual"],                          # (n, T*frameskip+1, H, W, 3) uint8
+                    # WM reconstructions + imaginations (from _generate_wm_visuals)
+                    **viz,
+                },
+                f,
+            )
+        print(f"Dumped plan visuals to {os.path.abspath('plan_visuals.pkl')}")
+
+        # === evals.json: per-eval per-iter metrics ===
+        eval_data = self._compute_evals_json(actions, e_obses, e_states, action_len, successes)
+        result = {
+            "summary": {
+                "n_evals":      self.n_evals,
+                "start_time":   self._start_iso,
+                "duration_sec": round(time.time() - self._t0, 1),
+                "final":        eval_data["final"],
+                "per_iter":     eval_data["per_iter"],
+            },
+            "evals": eval_data["evals"],
+        }
+        with open("evals.json", "w") as f:
+            json.dump(result, f, indent=2)
+        print(f"Dumped evals to {os.path.abspath('evals.json')}")
+
         logs = {f"final_eval/{k}": v for k, v in logs.items()}
         self.wandb_run.log(logs)
         logs_entry = {
@@ -458,23 +661,25 @@ def planning_main(cfg_dict):
     )
     model = load_model(model_ckpt, model_cfg, num_action_repeat, device=device)
 
+    # Resolve env id: cfg.setting → cfg.env_id_map[setting] overrides model's env.
+    # Lets one model checkpoint be evaluated on multiple maze variants.
+    setting = cfg_dict.get("setting")
+    env_id_map = cfg_dict.get("env_id_map") or {}
+    env_id = env_id_map.get(setting, model_cfg.env.name) if setting else model_cfg.env.name
+
     # use dummy vector env for wall and deformable envs
     if model_cfg.env.name == "wall" or model_cfg.env.name == "deformable_env":
         from env.serial_vector_env import SerialVectorEnv
         env = SerialVectorEnv(
             [
-                gym.make(
-                    model_cfg.env.name, *model_cfg.env.args, **model_cfg.env.kwargs
-                )
+                gym.make(env_id, *model_cfg.env.args, **model_cfg.env.kwargs)
                 for _ in range(cfg_dict["n_evals"])
             ]
         )
     else:
         env = SubprocVectorEnv(
             [
-                lambda: gym.make(
-                    model_cfg.env.name, *model_cfg.env.args, **model_cfg.env.kwargs
-                )
+                lambda: gym.make(env_id, *model_cfg.env.args, **model_cfg.env.kwargs)
                 for _ in range(cfg_dict["n_evals"])
             ]
         )

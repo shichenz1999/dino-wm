@@ -188,7 +188,10 @@ class MazeEnv(mujoco_env.MujocoEnv, utils.EzPickle, offline_env.OfflineEnv):
         with model.asfile() as f:
             mujoco_env.MujocoEnv.__init__(self, model_path=f.name, frame_skip=5)
         utils.EzPickle.__init__(self)
-        
+
+        if not self.with_target:
+            self.model.site_rgba[self.model.site_name2id('target_site'), 3] = 0.0
+
         if self.return_value == 'obs':
             self.observation_space = gym.spaces.Box(
                 low=0,               

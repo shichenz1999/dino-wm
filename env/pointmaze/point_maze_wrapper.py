@@ -19,39 +19,38 @@ class PointMazeWrapper(MazeEnv):
         self.action_dim = self.action_space.shape[0]
     
     def sample_random_init_goal_states(self, seed):
-        """
-        Return two random states: one as the initial state and one as the goal state.
+        """Sample init + goal states. Maze-agnostic: picks from valid cells in
+        self.reset_locations (auto-computed from maze_arr by MazeEnv).
+        Jitter matches MazeEnv's built-in reset (±0.1) to stay clear of walls.
         """
         rs = np.random.RandomState(seed)
+        cells = self.reset_locations + self.goal_locations  # all walkable cells
 
         def generate_state():
-            valid = False
-            while not valid:
-                x = rs.uniform(0.5, 3.1)
-                y = rs.uniform(0.5, 3.1)
-                valid = ((0.5 <= x <= 1.1 or 2.5 <= x <= 3.1) and (0.5 <= y <= 3.1))\
-                        or ((1.1 < x < 2.5) and (2.5 <= y <= 3.1))
-            state = np.array([
-                x, 
-                y,
-                rs.uniform(low=STATE_RANGES[2][0], high=STATE_RANGES[2][1]),
-                rs.uniform(low=STATE_RANGES[3][0], high=STATE_RANGES[3][1]),
+            w, h = cells[rs.randint(len(cells))]
+            x = w + rs.uniform(-0.1, 0.1)
+            y = h + rs.uniform(-0.1, 0.1)
+            return np.array([
+                x, y,
+                rs.uniform(STATE_RANGES[2][0], STATE_RANGES[2][1]),
+                rs.uniform(STATE_RANGES[3][0], STATE_RANGES[3][1]),
             ])
-            return state
 
-        init_state = generate_state()
-        goal_state = generate_state()
-        return init_state, goal_state
+        return generate_state(), generate_state()
     
     def update_env(self, env_info):
         pass 
     
     def eval_state(self, goal_state, cur_state):
-        success = np.linalg.norm(goal_state[:2] - cur_state[:2]) < 0.5
-        state_dist = np.linalg.norm(goal_state - cur_state)
+        pos_dist = np.linalg.norm(goal_state[..., :2] - cur_state[..., :2], axis=-1)
+        vel_dist = np.linalg.norm(goal_state[..., 2:] - cur_state[..., 2:], axis=-1)
+        state_dist = np.linalg.norm(goal_state - cur_state, axis=-1)
+        success = pos_dist < 0.5
         return {
             'success': success,
             'state_dist': state_dist,
+            'pos_dist': pos_dist,
+            'vel_dist': vel_dist,
         }
 
     def prepare(self, seed, init_state):
