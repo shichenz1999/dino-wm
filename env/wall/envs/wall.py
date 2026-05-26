@@ -69,8 +69,8 @@ class DotWall(gym.Env):
         self.wall_img = self._render_walls(self.wall_x, self.hole_y)
         if location is None:
             # self._generate_start_and_target()
-            dot_position = self.generate_random_state()
-            self.dot_position = torch.tensor(dot_position).to(self.device)
+            start_pos, target_pos = self.generate_random_state()
+            self.dot_position = torch.tensor(start_pos).to(self.device)
         else:
             self.dot_position = location.squeeze() if len(location.shape) == 2 else location
             self.dot_position = location.to(self.device)
