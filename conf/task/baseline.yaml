@@ -1,0 +1,4 @@
+# @package _global_
+# Default task: no task-specific overrides (standard reach-goal).
+variant_type: baseline
+variant: baseline

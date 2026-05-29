@@ -3,16 +3,19 @@ import torch
 import torch.nn as nn
 
 
-def create_objective_fn(alpha, base, mode="last"):
+def create_objective_fn(alpha, base, mode="last", invert=False):
     """
     Loss calculated on the last pred frame.
     Args:
         alpha: int
         base: int. only used for objective_fn_all
+        invert: if True, returns -loss so the planner MAXIMIZES distance
+                instead of minimizing it (used for avoid-goal style tasks).
     Returns:
         loss: tensor (B, )
     """
     metric = nn.MSELoss(reduction="none")
+    sign = -1.0 if invert else 1.0
 
     def objective_fn_last(z_obs_pred, z_obs_tgt):
         """
@@ -29,7 +32,7 @@ def create_objective_fn(alpha, base, mode="last"):
             dim=tuple(range(1, z_obs_pred["proprio"].ndim))
         )
         loss = loss_visual + alpha * loss_proprio
-        return loss
+        return sign * loss
 
     def objective_fn_all(z_obs_pred, z_obs_tgt):
         """
@@ -53,7 +56,7 @@ def create_objective_fn(alpha, base, mode="last"):
         loss_visual = (loss_visual * coeffs).mean(dim=1)
         loss_proprio = (loss_proprio * coeffs).mean(dim=1)
         loss = loss_visual + alpha * loss_proprio
-        return loss
+        return sign * loss
 
     if mode == "last":
         return objective_fn_last

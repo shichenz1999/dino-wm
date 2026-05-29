@@ -111,6 +111,8 @@ def build_plan_cfg_dicts(
 
 
 class PlanWorkspace:
+    # ---- setup: wire up wm / dset / env / planner / evaluator ----
+
     def __init__(
         self,
         cfg_dict: dict,
@@ -122,6 +124,11 @@ class PlanWorkspace:
         wandb_run: wandb.run,
     ):
         self.cfg_dict = cfg_dict
+        # Auto-pair: objective.invert=true defaults success.mode to 'avoid'
+        # (explicit success.mode is still respected).
+        if (cfg_dict.get("objective", {}).get("invert")
+                and (cfg_dict.get("success") or {}).get("mode", "default") == "default"):
+            cfg_dict.setdefault("success", {})["mode"] = "avoid"
         self.wm = wm
         self.dset = dset
         self.env = env
@@ -129,6 +136,10 @@ class PlanWorkspace:
         self.frameskip = frameskip
         self.wandb_run = wandb_run
         self.device = next(wm.parameters()).device
+        # Task success criterion (closure captures self.state_g lazily; built
+        # here since it only needs cfg + env_name, evaluated at call time).
+        self._avoid = self._avoid_params()
+        self._success_fn = (lambda s: self._avoid_metrics(s)[1]) if self._avoid else None
         # Wall-clock timing of the full planning run
         self._t0 = time.time()
         self._start_iso = datetime.now().isoformat(timespec="seconds")
@@ -172,6 +183,7 @@ class PlanWorkspace:
             seed=self.eval_seed,
             preprocessor=self.data_preprocessor,
             n_plot_samples=self.cfg_dict["n_plot_samples"],
+            success_fn=self._success_fn,
         )
 
         if self.wandb_run is None or isinstance(
@@ -199,6 +211,8 @@ class PlanWorkspace:
             self.planner.n_taken_actions = cfg_dict["goal_H"]
         else:
             self.planner.horizon = cfg_dict["goal_H"]
+
+    # ---- targets: pick init + goal conditions ----
 
     def prepare_targets(self):
         states = []
@@ -309,35 +323,53 @@ class PlanWorkspace:
         self.gt_actions = data["gt_actions"]
         self.goal_H = data["goal_H"]
 
-    def _wm_decode_uint8(self, z):
-        """WM decode → uint8 frames. Decoder outputs in [-1, 1], we map to [0, 255]."""
-        visuals = self.wm.decode_obs(z)[0]["visual"]
-        return (((visuals.clamp(-1, 1) + 1) / 2) * 255).cpu().numpy().astype(np.uint8)
+    # ---- task criterion (avoid-goal) ----
 
-    def _generate_wm_visuals(self, actions, e_obses):
-        """
-        Generate WM visualization frames for plan_visuals.pkl.
+    def _avoid_params(self):
+        """(maze_spec, margin, frac) for the avoid task, or None for reach."""
+        s = (self.cfg_dict.get("success") or {})
+        mode = s.get("mode", "default")
+        if mode == "default" or self.env_name != "point_maze":
+            return None
+        if mode != "avoid":
+            raise ValueError(f"Unknown success.mode: {mode}")
+        return self._maze_spec(), float(s.get("margin", 0.5)), s.get("frac", None)
 
-        For MPC: rollout WM separately per iter, using the real env obs at iter
-        start (extracted from e_obses). Mirrors MPC's true predictions — iter k
-        starts from the env state that resulted from executing actions through
-        iter k-1.
-        For non-MPC (open-loop CEM/GD): single rollout from initial state.
+    def _avoid_metrics(self, states):
+        """avoid: per-eval (dist_to_far[], success[]) via the single avoid_eval."""
+        from env.pointmaze.geo_dist import avoid_eval
+        maze_spec, margin, frac = self._avoid
+        states = np.asarray(states)
+        n = states.shape[0]
+        far = np.zeros(n)
+        ok = np.zeros(n, dtype=bool)
+        for i in range(n):
+            far[i], _, ok[i] = avoid_eval(
+                maze_spec, self.state_g[i, :2], states[i, :2], margin, frac)
+        return far, ok
 
-        Returns dict with keys: wm_obs_0_recon, wm_obs_g_recon, wm_imagined.
-        """
-        n_taken = getattr(self.planner, "n_taken_actions", None)
-        # Side effect: save iter-end latents (last frame of each iter's rollout)
-        # so the evals.json metric loop can compute env-vs-imagined divergence
-        # without re-running WM.
-        self._iter_end_latents = []
+    def _maze_spec(self):
+        """Maze spec string for the current `setting` (default U_MAZE)."""
+        from env.pointmaze.maze_model import (
+            U_MAZE, U_MAZE_EVAL, MEDIUM_MAZE, MEDIUM_MAZE_EVAL,
+            LARGE_MAZE, LARGE_MAZE_EVAL, SMALL_MAZE, OPEN,
+        )
+        spec_map = {
+            "u_maze": U_MAZE, "u_maze_eval": U_MAZE_EVAL,
+            "medium": MEDIUM_MAZE, "medium_eval": MEDIUM_MAZE_EVAL,
+            "large":  LARGE_MAZE,  "large_eval":  LARGE_MAZE_EVAL,
+            "small":  SMALL_MAZE,  "open":        OPEN,
+        }
+        return spec_map.get(self.cfg_dict.get("setting", ""), U_MAZE)
 
+    # ---- WM latent rollout (for visualization) ----
+
+    def _generate_wm_latents(self, actions, e_obses):
+        self._rollout_latents = []
         with torch.no_grad():
+            n_taken = getattr(self.planner, "n_taken_actions", None)
             if n_taken:
-                # MPC path: per-iter rollout. Each iter starts from the real env
-                # state at its starting frame (index k * n_taken * frameskip in e_obses).
                 n_iters = actions.shape[1] // n_taken
-                per_iter_uint8 = []
                 for k in range(n_iters):
                     start_idx = k * n_taken * self.frameskip
                     iter_obs = {
@@ -349,46 +381,28 @@ class PlanWorkspace:
                         self.data_preprocessor.transform_obs(iter_obs),
                         self.evaluator.device,
                     )
-                    iter_z, _ = self.wm.rollout(obs_0=trans_iter_obs, act=iter_acts)
-                    per_iter_uint8.append(self._wm_decode_uint8(iter_z))
-                    # Save the iter-end imagined latent (last timestep), keeping
-                    # the dict-of-tensors structure that wm.encode_obs also returns.
-                    self._iter_end_latents.append({
-                        key: arr[:, -1:].detach() for key, arr in iter_z.items()
+                    z_obses, _ = self.wm.rollout(obs_0=trans_iter_obs, act=iter_acts)
+                    self._rollout_latents.append({
+                        key: val.detach().cpu() for key, val in z_obses.items()
                     })
-                # iter 0 frame 0 = obs_0 recon; concat all iters' frames 1+ as imaginations
-                wm_obs_0_recon = per_iter_uint8[0][:, 0:1]
-                wm_imagined = np.concatenate(
-                    [v[:, 1:] for v in per_iter_uint8], axis=1
-                )
             else:
-                # Open-loop fallback: single rollout from initial state
                 trans_obs_0 = move_to_device(
                     self.data_preprocessor.transform_obs(self.obs_0),
                     self.evaluator.device,
                 )
-                full_z, _ = self.wm.rollout(obs_0=trans_obs_0, act=actions.detach())
-                full_uint8 = self._wm_decode_uint8(full_z)
-                wm_obs_0_recon = full_uint8[:, 0:1]
-                wm_imagined = full_uint8[:, 1:]
-                # Single "iter" — save the final latent so the metric loop works
-                self._iter_end_latents.append({
-                    key: arr[:, -1:].detach() for key, arr in full_z.items()
+                z_obses, _ = self.wm.rollout(obs_0=trans_obs_0, act=actions.detach())
+                self._rollout_latents.append({
+                    key: val.detach().cpu() for key, val in z_obses.items()
                 })
 
-            # Goal reconstruction (same for both paths)
             trans_obs_g = move_to_device(
                 self.data_preprocessor.transform_obs(self.obs_g),
                 self.evaluator.device,
             )
             z_obs_g = self.wm.encode_obs(trans_obs_g)
-            wm_obs_g_recon = self._wm_decode_uint8(z_obs_g)
+            self._z_obs_g = {key: val.detach().cpu() for key, val in z_obs_g.items()}
 
-        return {
-            "wm_obs_0_recon": wm_obs_0_recon,
-            "wm_obs_g_recon": wm_obs_g_recon,
-            "wm_imagined":    wm_imagined,
-        }
+    # ---- metrics + evals.json ----
 
     def _per_iter_metrics(self, k, n_taken, action_len_int, e_obses, e_states):
         """Compute the 8 per-eval metrics at iter k (1-indexed at k+1).
@@ -405,6 +419,11 @@ class PlanWorkspace:
         ii = np.arange(n)
 
         metrics = dict(self.env.eval_state(self.state_g, e_states[ii, end_step]))
+        # Task-variant success override (e.g. avoid_goal flips the criterion).
+        if self._avoid is not None:
+            far, ok = self._avoid_metrics(e_states[ii, end_step])
+            metrics["success"] = ok
+            metrics["dist_to_far"] = far
 
         # Observation-level (int32 cast avoids uint8 wrap-around).
         v_now = e_obses["visual"][ii, end_step].reshape(n, -1).astype(np.int32)
@@ -423,14 +442,68 @@ class PlanWorkspace:
             env_z = self.wm.encode_obs(trans_cur)
         imagined_z = {
             key: torch.stack(
-                [self._iter_end_latents[int(iter_idx[i])][key][i, 0] for i in range(n)]
-            ).unsqueeze(1)
-            for key in self._iter_end_latents[0].keys()
+                [self._rollout_latents[int(iter_idx[i])][key][i, -1] for i in range(n)]
+            ).unsqueeze(1).to(self.evaluator.device)
+            for key in self._rollout_latents[0].keys()
         }
         for key in ("visual", "proprio"):
             diff = env_z[key] - imagined_z[key]
             metrics[f"div_{key}_emb"] = diff.flatten(1).norm(dim=1).cpu().numpy()
         return metrics
+
+    def _per_iter_step_arrays(self, k, n_taken, action_len_int, e_obses, e_states):
+        """Per-step distance-to-goal curves for iter k: {metric: (n_evals, n_taken)}.
+
+        step j=1..n_taken -> env step (k*n_taken+j)*frameskip, capped at each
+        eval's executed length. Uses the real in-memory obs (e_obses) and goal
+        (obs_g), so values are bit-exact to planning -- no replay/rendering. The
+        actual visual latent is encoded once and shared by latent_dist + wm_mse.
+        Means/normalization/correlations are left to downstream consumers.
+        """
+        n = self.n_evals
+        fs = self.frameskip
+        steps = np.arange(1, n_taken + 1)
+        raw = (k * n_taken + steps)[None, :] * fs                  # (1, n_taken)
+        cap = np.minimum(action_len_int * fs, e_states.shape[1] - 1)[:, None]
+        est = np.minimum(raw, cap)                                 # (n, n_taken)
+        ii = np.arange(n)[:, None]
+
+        out = {}
+        # pixel: ||obs_step - obs_goal|| (int32 cast avoids uint8 wrap-around)
+        v = e_obses["visual"][ii, est].reshape(n, n_taken, -1).astype(np.int32)
+        vg = self.obs_g["visual"][:, 0].reshape(n, 1, -1).astype(np.int32)
+        out["pixel_dist_steps"] = np.linalg.norm(v - vg, axis=-1)
+
+        # geodesic distance to goal (point_maze only; eikonal field per goal)
+        if self.env_name == "point_maze":
+            from env.pointmaze.geo_dist import field_for
+            maze_spec = self._maze_spec()
+            geo = np.zeros((n, n_taken))
+            for i in range(n):
+                field = field_for(maze_spec, self.state_g[i, :2])
+                for j in range(n_taken):
+                    geo[i, j] = field.distance(e_states[i, est[i, j], :2])
+            out["geo_dist_steps"] = geo
+
+        # actual visual latent at every step (shared by latent_dist + wm_mse)
+        cur_obs = {key: arr[ii, est] for key, arr in e_obses.items()}   # (n, n_taken, ...)
+        trans = move_to_device(
+            self.data_preprocessor.transform_obs(cur_obs), self.evaluator.device
+        )
+        with torch.no_grad():
+            z_act = self.wm.encode_obs(trans)["visual"]                # (n, n_taken, P, D)
+        zg = self._z_obs_g["visual"].to(self.evaluator.device)         # (n, 1, P, D)
+        out["latent_dist_steps"] = (
+            (z_act - zg).flatten(2).norm(dim=2).cpu().numpy()
+        )
+        kk = min(k, len(self._rollout_latents) - 1)
+        z_img = self._rollout_latents[kk]["visual"][:, 1:n_taken + 1].to(
+            self.evaluator.device
+        )                                                              # (n, n_taken, P, D)
+        out["wm_pred_mse_steps"] = (
+            ((z_img - z_act) ** 2).flatten(2).mean(dim=2).cpu().numpy()
+        )
+        return out
 
     def _compute_evals_json(self, actions, e_obses, e_states, action_len, successes):
         """Build the {evals, per_iter, final} payload for evals.json."""
@@ -443,6 +516,11 @@ class PlanWorkspace:
             self._per_iter_metrics(k, n_taken, action_len_int, e_obses, e_states)
             for k in range(max_iters)
         ]
+        per_iter_arrays = [
+            self._per_iter_step_arrays(k, n_taken, action_len_int, e_obses, e_states)
+            for k in range(max_iters)
+        ]
+        arr_round = {"wm_pred_mse_steps": 4}  # others -> 3 dp
 
         def _format_val(key, v):
             return bool(v) if key == "success" else round(float(v), 3)
@@ -450,10 +528,13 @@ class PlanWorkspace:
         evals = {}
         for i in range(self.n_evals):
             n_iters_i = max(1, int(np.ceil(action_len_int[i] / n_taken)))
-            iters = [
-                {"iter": k + 1, **{key: _format_val(key, m[key][i]) for key in m}}
-                for k, m in enumerate(per_iter_raw[:n_iters_i])
-            ]
+            iters = []
+            for k, m in enumerate(per_iter_raw[:n_iters_i]):
+                entry = {"iter": k + 1, **{key: _format_val(key, m[key][i]) for key in m}}
+                for akey, arr in per_iter_arrays[k].items():
+                    nd = arr_round.get(akey, 3)
+                    entry[akey] = [round(float(x), nd) for x in arr[i]]
+                iters.append(entry)
             evals[str(i)] = {
                 "success":    bool(successes[i]),
                 "action_len": int(action_len[i]),
@@ -474,55 +555,50 @@ class PlanWorkspace:
         final = {k: v for k, v in per_iter[-1].items() if k != "iter"}
         return {"evals": evals, "per_iter": per_iter, "final": final}
 
+    # ---- run: plan, evaluate, persist ----
+
     def perform_planning(self):
-        if self.debug_dset_init:
-            actions_init = self.gt_actions
-        else:
-            actions_init = None
+        """Run the planner, evaluate the result, and persist outputs."""
+        actions_init = self.gt_actions if self.debug_dset_init else None
         actions, action_len = self.planner.plan(
-            obs_0=self.obs_0,
-            obs_g=self.obs_g,
-            actions=actions_init,
+            obs_0=self.obs_0, obs_g=self.obs_g, actions=actions_init,
         )
         action_len = np.where(np.isfinite(action_len), action_len, actions.shape[1])
         logs, successes, e_obses, e_states = self.evaluator.eval_actions(
             actions.detach(), action_len, save_video=True, filename="output_final"
         )
+        # successes/logs already reflect the task criterion: the evaluator applies
+        # self._success_fn (avoid) when set, else env eval_state (reach).
+        return self._dump_outputs(actions, action_len, successes, e_obses, e_states, logs)
 
-        # === plan_meta.pkl: per-trajectory data + algorithm results (~KB) ===
+    def _dump_outputs(self, actions, action_len, successes, e_obses, e_states, logs):
+        """Write plan_meta.pkl, plan_latents.pkl, evals.json and the log line."""
+        # plan_meta.pkl: per-trajectory task + algorithm output
         with open("plan_meta.pkl", "wb") as f:
             pickle.dump(
                 {
-                    # task (per-traj, state-level)
-                    "state_0":    self.state_0,                               # (n, state_dim)
-                    "state_g":    self.state_g,                               # (n, state_dim)
-                    "gt_actions": self.gt_actions,                            # (n, T, ...) | None
-                    # algorithm output (per-traj)
-                    "actions":    actions.detach().cpu().numpy(),             # (n, T, action_dim)
-                    "action_len": action_len,                                 # (n,) int, steps executed
-                    "successes":  np.asarray(successes),                      # (n,) bool, reached goal
-                    "e_states":   e_states,                                   # (n, T*frameskip+1, state_dim)
+                    "state_0":    self.state_0,                   # (n, state_dim)
+                    "state_g":    self.state_g,                   # (n, state_dim)
+                    "gt_actions": self.gt_actions,                # (n, T, ...) | None
+                    "actions":    actions.detach().cpu().numpy(),  # (n, T, action_dim)
+                    "action_len": action_len,                     # (n,) steps executed
+                    "successes":  np.asarray(successes),          # (n,) bool
+                    "e_states":   e_states,                       # (n, T*frameskip+1, state_dim)
                 },
                 f,
             )
         print(f"Dumped plan meta to {os.path.abspath('plan_meta.pkl')}")
 
-        # === plan_visuals.pkl: per-trajectory pixel data (~MB) ===
-        viz = self._generate_wm_visuals(actions, e_obses)
-        with open("plan_visuals.pkl", "wb") as f:
+        # plan_latents.pkl: WM rollout latents (for visualization)
+        self._generate_wm_latents(actions, e_obses)
+        with open("plan_latents.pkl", "wb") as f:
             pickle.dump(
-                {
-                    # real env (MuJoCo)
-                    "obs_g":      self.obs_g["visual"],                       # (n, 1, H, W, 3) uint8
-                    "env_frames": e_obses["visual"],                          # (n, T*frameskip+1, H, W, 3) uint8
-                    # WM reconstructions + imaginations (from _generate_wm_visuals)
-                    **viz,
-                },
+                {"wm_rollout_latents": self._rollout_latents, "z_obs_g": self._z_obs_g},
                 f,
             )
-        print(f"Dumped plan visuals to {os.path.abspath('plan_visuals.pkl')}")
+        print(f"Dumped plan latents to {os.path.abspath('plan_latents.pkl')}")
 
-        # === evals.json: per-eval per-iter metrics ===
+        # evals.json: per-eval per-iter metrics
         eval_data = self._compute_evals_json(actions, e_obses, e_states, action_len, successes)
         result = {
             "summary": {
@@ -538,14 +614,12 @@ class PlanWorkspace:
             json.dump(result, f, indent=2)
         print(f"Dumped evals to {os.path.abspath('evals.json')}")
 
+        # logs.json line + wandb
         logs = {f"final_eval/{k}": v for k, v in logs.items()}
         self.wandb_run.log(logs)
         logs_entry = {
-            key: (
-                value.item()
-                if isinstance(value, (np.float32, np.int32, np.int64))
-                else value
-            )
+            key: (value.item()
+                  if isinstance(value, (np.float32, np.int32, np.int64)) else value)
             for key, value in logs.items()
         }
         with open(self.log_filename, "a") as file:
@@ -661,11 +735,19 @@ def planning_main(cfg_dict):
     )
     model = load_model(model_ckpt, model_cfg, num_action_repeat, device=device)
 
-    # Resolve env id: cfg.setting → cfg.env_id_map[setting] overrides model's env.
-    # Lets one model checkpoint be evaluated on multiple maze variants.
+    # Resolve env id from (setting, variant_type, variant). baseline lives
+    # directly under setting; other variants are nested under variant_type/variant.
     setting = cfg_dict.get("setting")
+    variant_type = cfg_dict.get("variant_type", "baseline")
+    variant = cfg_dict.get("variant", "baseline")
     env_id_map = cfg_dict.get("env_id_map") or {}
-    env_id = env_id_map.get(setting, model_cfg.env.name) if setting else model_cfg.env.name
+    if setting and setting in env_id_map:
+        if variant_type == "baseline":
+            env_id = env_id_map[setting].get("baseline", model_cfg.env.name)
+        else:
+            env_id = env_id_map[setting].get(variant_type, {}).get(variant, model_cfg.env.name)
+    else:
+        env_id = model_cfg.env.name
 
     # use dummy vector env for wall and deformable envs
     if model_cfg.env.name == "wall" or model_cfg.env.name == "deformable_env":

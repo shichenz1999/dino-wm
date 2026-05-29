@@ -1,0 +1,11 @@
+# @package _global_
+# Avoid-goal task: planner maximizes geodesic distance from goal; success =
+# geo_dist(ball,goal) >= max_geo_dist - margin. Bundles knobs for task=avoid_goal.
+variant_type: task
+variant: avoid_goal
+objective:
+  invert: true
+success:
+  mode: avoid
+  margin: 0.5          # success iff geo_dist >= max_geo_dist - margin (world units)
+  frac: null           # optional: >= frac * max_geo_dist (overrides margin)

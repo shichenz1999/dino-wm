@@ -14,6 +14,8 @@ STATE_RANGES = np.array([
 ])
 
 class PointMazeWrapper(MazeEnv):
+    REACH_THRESH = 0.5
+
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         self.action_dim = self.action_space.shape[0]
@@ -45,7 +47,7 @@ class PointMazeWrapper(MazeEnv):
         pos_dist = np.linalg.norm(goal_state[..., :2] - cur_state[..., :2], axis=-1)
         vel_dist = np.linalg.norm(goal_state[..., 2:] - cur_state[..., 2:], axis=-1)
         state_dist = np.linalg.norm(goal_state - cur_state, axis=-1)
-        success = pos_dist < 0.5
+        success = pos_dist < self.REACH_THRESH
         return {
             'success': success,
             'state_dist': state_dist,

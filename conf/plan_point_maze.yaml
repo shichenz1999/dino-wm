@@ -1,12 +1,13 @@
 defaults:
   - _self_
+  - task: baseline       # task=avoid_goal bundles variant/objective.invert/success.mode
   # - override hydra/launcher: submitit_slurm
 
 hydra:
   run:
-    dir: plan_outputs/${now:%Y%m%d%H%M%S}_${replace_slash:${model_name}}_${setting}_gH${goal_H}
+    dir: plan_outputs/${setting}/${variant_path:${variant_type},${variant}}/${now:%Y%m%d%H%M%S}_gH${goal_H}
   sweep:
-    dir: plan_outputs/${now:%Y%m%d%H%M%S}_${replace_slash:${model_name}}_${setting}_gH${goal_H}
+    dir: plan_outputs/${setting}/${variant_path:${variant_type},${variant}}/${now:%Y%m%d%H%M%S}_gH${goal_H}
     subdir: ${hydra.job.num}
   # launcher:
   #   submitit_folder: ${hydra.sweep.dir}/.submitit/%j
@@ -37,8 +38,14 @@ debug_dset_init: False
 objective:
   _target_: planning.objectives.create_objective_fn
   alpha: 0
-  base: 2 
+  base: 2
   mode: last
+  invert: false        # set true for avoid-goal style tasks
+
+# Success: mode=default = reach (pos_dist<0.5); mode=avoid = geodesic avoid-goal.
+# avoid knobs (margin/frac) live in conf/task/avoid_goal.yaml.
+success:
+  mode: default
 
 planner:
   _target_: planning.mpc.MPCPlanner
@@ -54,15 +61,37 @@ planner:
     eval_every: 1
   name: mpc_cem
 
-# Maze variant to plan on. Override at CLI: `python plan.py setting=medium`.
-# env_id_map: setting → registered gym env id (in env/pointmaze/__init__.py)
+# Maze layout. Override at CLI: `python plan.py setting=medium`.
 setting: u_maze
+
+# Variant axis (baseline = no overrides; otherwise pick a type + name).
+# Override at CLI: `setting=u_maze variant_type=color variant=purpleball`.
+variant_type: baseline
+variant: baseline
+
+# env_id_map: nested by setting → variant_type → variant → registered gym env id.
+# (baseline lives directly under setting, no variant_type/variant level.)
 env_id_map:
-  u_maze:        maze2d-umaze-v1
-  u_maze_eval:   maze2d-eval-umaze-v1
-  medium:        maze2d-medium-v1
-  medium_eval:   maze2d-eval-medium-v1
-  large:         maze2d-large-v1
-  large_eval:    maze2d-eval-large-v1
-  small:         maze2d-small-v0
-  open:          maze2d-open-v0
+  u_maze:
+    baseline: maze2d-umaze-v1
+    color:
+      purpleball: maze2d-umaze-purpleball-v1
+      graywall:   maze2d-umaze-graywall-v1
+      whitefloor: maze2d-umaze-whitefloor-v1
+      all:        maze2d-umaze-all-v1
+    task:
+      avoid_goal: maze2d-umaze-avoidgoal-v1
+  u_maze_eval:
+    baseline: maze2d-eval-umaze-v1
+  medium:
+    baseline: maze2d-medium-v1
+  medium_eval:
+    baseline: maze2d-eval-medium-v1
+  large:
+    baseline: maze2d-large-v1
+  large_eval:
+    baseline: maze2d-eval-large-v1
+  small:
+    baseline: maze2d-small-v0
+  open:
+    baseline: maze2d-open-v0

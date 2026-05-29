@@ -3,21 +3,23 @@
 Annotated visualizations for a plan_outputs/<run>/ directory.
 
 Reads:
-    .hydra/config.yaml (single source of truth for config)
+    .hydra/config.yaml
     plan_meta.pkl      (state_0/g, gt_actions, actions, action_len, successes, e_states)
-    plan_visuals.pkl   (obs_g, env_frames, wm_obs_0_recon, wm_obs_g_recon, wm_imagined)
+    plan_latents.pkl   (wm_rollout_latents, z_obs_g)
+    evals.json
 
 Writes:
-    summary.png                              global overview
-    evals/eval_N/trajectory.png              one eval's trajectory plot
-    evals/eval_N/frames.png                  7-column grid (env vs imagined)
-    evals/eval_N/video.mp4                   annotated video with goal overlay
+    summary.png
+    evals/eval_N/trajectory.png
+    evals/eval_N/frames.png
+    evals/eval_N/video.mp4
 
 Usage:
     python scripts/visualize_plan.py plan_outputs/<run>/
 """
 
 import sys
+import os
 import json
 import pickle
 from pathlib import Path
@@ -26,54 +28,90 @@ from PIL import Image, ImageDraw, ImageFont
 from omegaconf import OmegaConf
 import matplotlib
 matplotlib.use("Agg")
-import matplotlib.pyplot as plt
-from matplotlib.patches import Rectangle
-from matplotlib import cm
 import imageio
+import torch
+from einops import rearrange
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(PROJECT_ROOT))
+import env.pointmaze  # noqa: F401  (registers gym envs)
+import gym
 
 
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 # Constants
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 
-# PointMaze U-maze open regions (in MuJoCo (x, y) coordinates).
-# Derived from env/pointmaze/point_maze_wrapper.py:
-#   left corridor:  x ∈ [0.5, 1.1], y ∈ [0.5, 3.1]
-#   right corridor: x ∈ [2.5, 3.1], y ∈ [0.5, 3.1]
-#   top connector:  x ∈ [1.1, 2.5], y ∈ [2.5, 3.1]
 U_MAZE_OPEN_REGIONS = [
-    (0.5, 1.1, 0.5, 3.1),   # left corridor (x_min, x_max, y_min, y_max)
-    (2.5, 3.1, 0.5, 3.1),   # right corridor
-    (1.1, 2.5, 2.5, 3.1),   # top connector
+    (0.5, 1.1, 0.5, 3.1),
+    (2.5, 3.1, 0.5, 3.1),
+    (1.1, 2.5, 2.5, 3.1),
 ]
-# Plot extent (slightly larger than the open region)
 MAZE_X_RANGE = (0.0, 3.6)
 MAZE_Y_RANGE = (0.0, 3.6)
 
-# Color constants
 COLOR_SUCCESS = (0, 160, 0)
 COLOR_FAILURE = (200, 0, 0)
 COLOR_TEXT = (255, 255, 255)
 COLOR_BG = (30, 30, 30)
 COLOR_PANEL_BG = (50, 50, 50)
 
-N_TIME_COLUMNS = 6   # detail PNG samples 6 time points + 1 goal column
+N_TIME_COLUMNS = 6
 
-# Success threshold per env (for the "pos_dist < thresh" comparator on viz titles).
-# evals.json already has the bool success (computed by env.eval_state), but the
-# numeric threshold is not in evals.json — kept here so titles can show "X < 0.5".
-SUCCESS_THRESH = {
-    "point_maze": 0.5,
-    "wall":       4.5,
-}
+MARKER_RADIUS = 6
 
 
-# -----------------------------------------------------------------------------
+def make_crit_label_fn(cfg, reach_thresh=0.5):
+    """Return fn(state, goal) -> criterion text for the banner.
+
+    reach: "pos_dist=X < thr"; avoid: "dist_to_far=X < margin". Single source for
+    the criterion text, used by every renderer so they can't drift. reach_thresh
+    comes from the env's REACH_THRESH (the same value its eval_state uses).
+    """
+    s = dict(cfg.get("success") or {})
+    inv = bool((cfg.get("objective") or {}).get("invert", False))
+    mode = s.get("mode", "default")
+    if mode == "default" and inv:
+        mode = "avoid"        # mirror plan.py auto-pair
+
+    if mode != "avoid":       # default reach: Euclidean distance to goal
+        thr = reach_thresh
+        def fn(state, goal):
+            d = float(np.linalg.norm(np.asarray(state)[:2] - np.asarray(goal)[:2]))
+            cmp = "<" if d < thr else "≥"
+            return f"pos_dist={d:.2f} {cmp} {thr:.2f}"
+        return fn
+
+    from env.pointmaze.geo_dist import avoid_eval
+    from env.pointmaze.maze_model import (
+        U_MAZE, U_MAZE_EVAL, MEDIUM_MAZE, MEDIUM_MAZE_EVAL,
+        LARGE_MAZE, LARGE_MAZE_EVAL, SMALL_MAZE, OPEN,
+    )
+    spec_map = {
+        "u_maze": U_MAZE, "u_maze_eval": U_MAZE_EVAL,
+        "medium": MEDIUM_MAZE, "medium_eval": MEDIUM_MAZE_EVAL,
+        "large":  LARGE_MAZE,  "large_eval":  LARGE_MAZE_EVAL,
+        "small":  SMALL_MAZE,  "open":        OPEN,
+    }
+    maze_spec = spec_map.get(str(cfg.get("setting", "")), U_MAZE)
+    margin = float(s.get("margin", 0.5))
+    frac = s.get("frac", None)
+
+    def fn(state, goal):
+        far, thr, ok = avoid_eval(maze_spec, np.asarray(goal)[:2],
+                                  np.asarray(state)[:2], margin, frac)
+        cmp = "<" if ok else "≥"
+        return f"dist_to_far={far:.2f} {cmp} {thr:.2f}"
+
+    return fn
+
+
+
+# ---------------------------------------------------------------------------
 # Font loading
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 
 def get_font(size=14, bold=False):
-    """Try common font paths."""
     candidates = [
         "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf" if bold else
         "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
@@ -87,37 +125,197 @@ def get_font(size=14, bold=False):
     return ImageFont.load_default()
 
 
-# -----------------------------------------------------------------------------
-# Data loading
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Data loading & model/env setup
+# ---------------------------------------------------------------------------
 
 def load_run(run_dir: Path):
-    """Load all data needed for visualization from a plan_outputs/<run>/ directory.
-
-    Format:
-      .hydra/config.yaml - full Hydra config (single source of truth)
-      plan_meta.pkl      - per-traj data + algorithm results
-      plan_visuals.pkl   - per-traj pixel data
-      evals.json         - per-eval per-iter metrics (success, pos_dist, etc.)
-    """
     cfg = OmegaConf.load(run_dir / ".hydra" / "config.yaml")
-
     with open(run_dir / "plan_meta.pkl", "rb") as f:
         meta = pickle.load(f)
-    with open(run_dir / "plan_visuals.pkl", "rb") as f:
-        visuals = pickle.load(f)
+    with open(run_dir / "plan_latents.pkl", "rb") as f:
+        latents = pickle.load(f)
     with open(run_dir / "evals.json") as f:
         evals = json.load(f)
+    return cfg, meta, latents, evals
 
-    return cfg, meta, visuals, evals
 
+def load_train_cfg(cfg):
+    model_path = Path(str(cfg.ckpt_base_path)) / "outputs" / str(cfg.model_name)
+    return OmegaConf.load(model_path / "hydra.yaml")
+
+
+def load_decoder(cfg, device="cpu"):
+    model_path = Path(str(cfg.ckpt_base_path)) / "outputs" / str(cfg.model_name)
+    ckpt_path = model_path / "checkpoints" / f"model_{cfg.model_epoch}.pth"
+    ckpt = torch.load(str(ckpt_path), map_location=device)
+    decoder = ckpt["decoder"].to(device)
+    decoder.eval()
+    return decoder
+
+
+def render_clean_bg(the_env):
+    """Render the maze with the ball site temporarily hidden (alpha=0).
+
+    The result is a TRULY ball-free background, used as the reference for
+    diff-based ball markers. Median-over-time picks up ghosts wherever the
+    ball lingered, which then bleed into start/final markers as artifacts.
+    """
+    raw = the_env.unwrapped
+    site_id = raw.model.site_name2id("particle_site")
+    saved_alpha = float(raw.model.site_rgba[site_id, 3])
+    raw.model.site_rgba[site_id, 3] = 0.0
+    img = raw.sim.render(224, 224).copy()
+    raw.model.site_rgba[site_id, 3] = saved_alpha
+    return img
+
+
+def create_render_env(cfg, train_cfg):
+    setting = cfg.get("setting")
+    variant_type = cfg.get("variant_type", "baseline")
+    variant = cfg.get("variant", "baseline")
+    env_id_map = cfg.get("env_id_map") or {}
+    if setting and setting in env_id_map:
+        if variant_type == "baseline":
+            env_id = env_id_map[setting].get("baseline", train_cfg.env.name)
+        else:
+            env_id = env_id_map[setting].get(variant_type, {}).get(variant, train_cfg.env.name)
+    else:
+        env_id = train_cfg.env.name
+    env_kwargs = dict(train_cfg.env.get("kwargs", {}))
+    the_env = gym.make(env_id, **env_kwargs)
+    the_env.unwrapped.prepare_for_render()
+    return the_env
+
+
+# ---------------------------------------------------------------------------
+# Coordinate mapping (state → pixel)
+# ---------------------------------------------------------------------------
+
+def calibrate_state_to_pixel(the_env):
+    """Render ball at two known walkable qpos values to find the linear
+    state→pixel mapping.
+
+    Calibration points are auto-picked as the two diagonal-extreme WALKABLE
+    cells (qpos == maze cell index), so the ball is never occluded by a wall.
+    Hardcoded (1,1)/(3,3) broke on mazes where (3,3) is a wall (e.g.
+    large_eval): the occluded ball produced 0 diff pixels → NaN calibration →
+    invisible trajectory line.
+    """
+    from env.pointmaze.maze_model import WALL
+    raw = the_env.unwrapped
+    zero_vel = np.zeros(2)
+
+    raw.set_state(np.array([50.0, 50.0]), zero_vel)
+    bg = raw.sim.render(224, 224)
+
+    def _find_center(pos):
+        raw.set_state(np.asarray(pos, dtype=float), zero_vel)
+        frame = raw.sim.render(224, 224)
+        diff = np.abs(frame.astype(float) - bg.astype(float)).sum(axis=-1)
+        ys, xs = np.where(diff > 30)
+        if len(xs) == 0:
+            return None
+        return np.array([xs.mean(), ys.mean()])
+
+    # Walkable cells, then pick the two diagonal extremes (min/max of w+h)
+    # so they differ in both axes → stable per-axis linear fit.
+    walkable = np.argwhere(raw.maze_arr != WALL).astype(float)
+    pos_a = walkable[np.argmin(walkable.sum(axis=1))]
+    pos_b = walkable[np.argmax(walkable.sum(axis=1))]
+    px_a, px_b = _find_center(pos_a), _find_center(pos_b)
+
+    # Fallback to legacy points if something went wrong (e.g. degenerate maze).
+    if (px_a is None or px_b is None
+            or np.any(pos_b == pos_a)):
+        pos_a, pos_b = np.array([1.0, 1.0]), np.array([3.0, 3.0])
+        px_a, px_b = _find_center(pos_a), _find_center(pos_b)
+
+    scale = (px_b - px_a) / (pos_b - pos_a)
+    offset = px_a - scale * pos_a
+    return scale, offset
+
+
+def state_to_pixel(xy, scale, offset):
+    """Map state (x, y) coordinates to pixel (px, py). xy shape: (..., 2+)."""
+    return xy[..., :2] * scale + offset
+
+
+# ---------------------------------------------------------------------------
+# Frame generation
+# ---------------------------------------------------------------------------
+
+def render_env_frames(the_env, e_states):
+    """Render env frames by setting state at each timestep."""
+    raw = the_env.unwrapped
+    n_evals, n_frames = e_states.shape[:2]
+    frames = np.zeros((n_evals, n_frames, 224, 224, 3), dtype=np.uint8)
+    for i in range(n_evals):
+        for t in range(n_frames):
+            raw.set_state(e_states[i, t, :2], e_states[i, t, 2:4])
+            frames[i, t] = raw.sim.render(224, 224)
+    return frames
+
+
+def render_single_frame(the_env, state):
+    raw = the_env.unwrapped
+    raw.set_state(state[:2], np.zeros(2))
+    return raw.sim.render(224, 224)
+
+
+def decode_wm_latents(decoder, z_visual, device="cpu"):
+    """Decode visual latents → (b, t, H, W, 3) uint8."""
+    z = z_visual.to(device)
+    b, t = z.shape[:2]
+    with torch.no_grad():
+        decoded, _ = decoder(z)
+    decoded = rearrange(decoded, "(b t) c h w -> b t c h w", b=b, t=t)
+    uint8 = (((decoded.clamp(-1, 1) + 1) / 2) * 255).cpu().numpy().astype(np.uint8)
+    return np.transpose(uint8, (0, 1, 3, 4, 2))
+
+
+def generate_wm_frames(decoder, latents, device="cpu"):
+    """Decode all WM latents. Returns (wm_frames_all, goal_recon_all) in HWC uint8."""
+    rollout_latents = latents["wm_rollout_latents"]
+    per_iter = [decode_wm_latents(decoder, z["visual"], device) for z in rollout_latents]
+
+    wm_obs_0_recon = per_iter[0][:, 0:1]
+    wm_imagined = np.concatenate([d[:, 1:] for d in per_iter], axis=1)
+    wm_frames_all = np.concatenate([wm_obs_0_recon, wm_imagined], axis=1)
+
+    goal_recon_all = decode_wm_latents(decoder, latents["z_obs_g"]["visual"], device)
+    return wm_frames_all, goal_recon_all
+
+
+# ---------------------------------------------------------------------------
+# Image utilities
+# ---------------------------------------------------------------------------
+
+def chw_to_hwc(img):
+    if img.ndim == 3 and img.shape[0] == 3:
+        return np.transpose(img, (1, 2, 0))
+    return img
+
+
+def blend_ball_marker(canvas, source_frame, clean_bg, color, alpha=1.0):
+    """Use (source - clean_bg) magnitude as a soft mask to paint `color` onto canvas.
+
+    Preserves the ball's anti-aliased edges and is color-agnostic — works
+    regardless of the actual ball color in source_frame.
+    """
+    diff = source_frame.astype(np.float32) - clean_bg.astype(np.float32)
+    signal = np.linalg.norm(diff, axis=-1, keepdims=True) / 255.0
+    signal = np.clip(signal * 2.0, 0, 1)
+    color_arr = np.array(color, dtype=np.float32)
+    result = canvas.astype(np.float32) * (1 - signal * alpha) + color_arr * (signal * alpha)
+    return np.clip(result, 0, 255).astype(np.uint8)
+
+
+# ---------------------------------------------------------------------------
+# Config formatting
+# ---------------------------------------------------------------------------
 
 def cfg_to_strings(cfg):
-    """Format hydra cfg as 3 short header lines for viz labels:
-    1) task / eval settings
-    2) MPC (outer) with full config field names
-    3) sub-planner (inner, indented under MPC) — typically CEM
-    """
     if cfg is None:
         return ("", "", "")
     planner_cfg = cfg.get("planner", {}) or {}
@@ -146,231 +344,82 @@ def cfg_to_strings(cfg):
 
 
 def estimate_mpc_iters(action_len, cfg=None):
-    """How many MPC outer iterations to slice action_len into.
-
-    For MPC: ceil(action_len / n_taken_actions). For non-MPC planners
-    (single open-loop plan), always 1.
-    """
     planner_cfg = (cfg or {}).get("planner", {}) or {}
     n_taken_cfg = planner_cfg.get("n_taken_actions")
     if n_taken_cfg is None:
-        return 1  # non-MPC: single open-loop plan, no iters
+        return 1
     return max(1, int(np.ceil(int(action_len) / max(1, n_taken_cfg))))
 
 
-# -----------------------------------------------------------------------------
-# Image utilities
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Trajectory plot
+# ---------------------------------------------------------------------------
 
-def chw_to_hwc(img):
-    """Convert (C, H, W) uint8 → (H, W, C) uint8."""
-    if img.ndim == 3 and img.shape[0] == 3:
-        return np.transpose(img, (1, 2, 0))
-    return img
-
-
-def detect_ball_center(img):
-    """Return (px, py) centroid of the green ball, or None if not found."""
-    img_n = img.astype(np.float32) / 255.0
-    r, g, b = img_n[..., 0], img_n[..., 1], img_n[..., 2]
-    mask = (g > 0.4) & (r < 0.5) & (b < 0.5) & (g > r) & (g > b)
-    if mask.sum() < 10:
-        return None
-    ys, xs = np.where(mask)
-    return float(xs.mean()), float(ys.mean())
-
-
-def detect_trajectory_pixels(env_frames):
-    """Detect ball center in each env_frame; interpolate over missing detections.
-
-    env_frames: (T, H, W, 3) uint8
-    Returns: (T, 2) array of (px, py).
-    """
-    raw = [detect_ball_center(f) for f in env_frames]
-    arr = np.full((len(raw), 2), np.nan, dtype=np.float32)
-    for i, p in enumerate(raw):
-        if p is not None:
-            arr[i] = p
-    # Linear interpolation over NaNs
-    for col in range(2):
-        nans = np.isnan(arr[:, col])
-        if nans.any() and (~nans).any():
-            arr[nans, col] = np.interp(
-                np.where(nans)[0], np.where(~nans)[0], arr[~nans, col]
-            )
-    return arr
-
-
-def overlay_goal_ghost(frame, goal_frame, clean_bg,
-                       color=(255, 50, 50), alpha=1.0):
-    """Diff-based colored overlay: place a colored goal ghost on the frame.
-
-    Steps:
-      1. diff = goal_frame - clean_bg  (non-zero only where the goal ball is)
-      2. ball_signal = diff's green channel (the ball is green in MuJoCo,
-         so its green channel is the cleanest "ball-ness" indicator)
-      3. paint with the given color * signal strength
-
-    Result: current frame stays untouched, a colored ghost appears at the
-    goal ball location. No mask extraction — works on any environment as
-    long as a clean background is available.
-    """
-    diff = goal_frame.astype(np.float32) - clean_bg.astype(np.float32)
-    ball_signal = np.clip(diff[..., 1:2], 0, 255)  # (H, W, 1) using green channel
-    color_arr = np.array(color, dtype=np.float32) / 255.0  # normalized RGB weights
-    colored = ball_signal * color_arr  # (H, W, 3) colored ghost
-    result = frame.astype(np.float32) + colored * alpha
-    return np.clip(result, 0, 255).astype(np.uint8)
-
-
-def compute_clean_bg(frames):
-    """Median over the time dimension → ball-free background.
-    frames: (T, H, W, 3) uint8
-    """
-    return np.median(frames, axis=0).astype(np.uint8)
-
-
-# -----------------------------------------------------------------------------
-# Trajectory plot (matplotlib)
-# -----------------------------------------------------------------------------
-
-def estimate_ball_radius_px(env_frames):
-    """Estimate ball radius (in pixels) by averaging detection across frames.
-
-    Accepts shape (..., H, W, 3): flattens leading dims to per-frame.
-    """
-    # Flatten leading dims so each "frame" is (H, W, 3)
-    frames = env_frames.reshape(-1, *env_frames.shape[-3:])
-    img_n = frames.astype(np.float32) / 255.0
-    r, g, b = img_n[..., 0], img_n[..., 1], img_n[..., 2]
-    mask = (g > 0.4) & (r < 0.5) & (b < 0.5) & (g > r) & (g > b)
-    # Pixel count per frame; convert to radius via area = π r²
-    counts = mask.sum(axis=(-2, -1))  # (N,) per-frame counts
-    counts = counts[counts >= 10]
-    if len(counts) == 0:
-        return 5.0  # fallback default
-    avg_area = counts.mean()
-    return float(np.sqrt(avg_area / np.pi))
-
-
-def _color_blend_ball(canvas_np, source_frame, clean_bg, color, alpha=1.0):
-    """Blend the ball from `source_frame` into `canvas_np`, retinted with `color`.
-
-    Uses the magnitude of the per-pixel difference (across all 3 RGB channels)
-    as the ball "signal" — this is more robust than using one channel because
-    the orange maze floor has non-zero green. The signal magnitude is then
-    used as a mask weight to REPLACE (not add) the background pixel with
-    the marker color. This preserves the ball's smooth anti-aliased edges
-    while making the marker visually solid.
-    """
-    diff = source_frame.astype(np.float32) - clean_bg.astype(np.float32)
-    # Magnitude of color change across all 3 channels, normalized to [0, 1]
-    signal = np.linalg.norm(diff, axis=-1, keepdims=True) / 255.0   # (H, W, 1)
-    signal = np.clip(signal * 2.0, 0, 1)                            # boost contrast
-    color_arr = np.array(color, dtype=np.float32)                   # (3,)
-    # Replace pixels with marker color, weighted by signal strength
-    result = canvas_np.astype(np.float32) * (1 - signal * alpha) + color_arr * (signal * alpha)
-    return np.clip(result, 0, 255).astype(np.uint8)
-
-
-def render_trajectory_plot(env_frames, goal_real, success, bg_img,
-                           ball_radius_px, scale=2,
+def render_trajectory_plot(e_states, state_g, success, bg_img,
+                           start_frame, final_frame, goal_frame,
+                           px_scale, px_offset, scale=2,
                            eval_idx=None, action_len=None,
-                           pos_dist=None, success_thresh=0.5,
-                           frameskip=5, cfg=None,
+                           cfg=None,
+                           start_color=(40, 200, 60),
+                           crit_label=None,
                            show_title=True, show_legend=True):
-    """Draw a trajectory on top of a clean MuJoCo render.
+    final_color = (50, 130, 240)
+    goal_color = (220, 50, 50)
 
-    Trajectory points come directly from color-detecting the ball in each
-    env_frame — no MuJoCo→pixel fitting; the trajectory passes through the
-    exact pixel the ball occupied in each frame.
-
-    Start/Final/Goal markers are placed by **blending** the actual ball
-    appearance from env_frames[0], env_frames[-1], goal_real onto the
-    background — this preserves the smooth anti-aliased ball edges and
-    just re-tints them with marker colors (blue / red / green).
-
-    env_frames:  (T, H, W, 3) uint8 — actual env render frames
-    goal_real:   (H, W, 3) uint8    — goal-state env render
-    success:     bool               — title color
-    bg_img:      (H, W, 3) uint8    — ball-free maze background
-    Returns:     (H', W', 3) uint8
-    """
-    # Compose the marker overlays BEFORE upscaling.
-    # Trajectory colors: green (Start) → blue (Final). Goal red (video convention).
-    start_color = (40, 200, 60)    # green (matches the ball's natural color)
-    final_color = (50, 130, 240)   # blue
-    goal_color = (220, 50, 50)     # red
+    # Blend goal / start / final balls at native resolution to keep smooth edges.
     canvas = bg_img.copy()
-    canvas = _color_blend_ball(canvas, goal_real, bg_img, color=goal_color)
-    canvas = _color_blend_ball(canvas, env_frames[0], bg_img, color=start_color)
-    canvas = _color_blend_ball(canvas, env_frames[-1], bg_img, color=final_color)
+    canvas = blend_ball_marker(canvas, goal_frame, bg_img, color=goal_color)
+    canvas = blend_ball_marker(canvas, start_frame, bg_img, color=start_color)
+    canvas = blend_ball_marker(canvas, final_frame, bg_img, color=final_color)
 
-    # Upscale for sharper line drawing
+    H, W = canvas.shape[:2]
     pil = Image.fromarray(canvas).resize(
-        (canvas.shape[1] * scale, canvas.shape[0] * scale), Image.NEAREST,
-    ).convert("RGB")
-    draw = ImageDraw.Draw(pil, "RGBA")
+        (W * scale, H * scale), Image.NEAREST
+    ).convert("RGBA")
+    draw = ImageDraw.Draw(pil)
 
-    # Detect ball pixel position directly in each frame (for trajectory line)
-    traj_px = detect_trajectory_pixels(env_frames) * scale  # (T, 2)
-    goal_pix = detect_ball_center(goal_real)
-    if goal_pix is None:
-        goal_pix = (bg_img.shape[1] / 2, bg_img.shape[0] / 2)
-    goal_px = np.array(goal_pix) * scale
-
-    # Marker size matches actual ball radius in the upscaled image
-    R = ball_radius_px * scale
-
-    # Trajectory line: linear interpolation between start_color and final_color
+    traj_px = state_to_pixel(e_states[:, :2], px_scale, px_offset) * scale
+    line_w = max(2, int(MARKER_RADIUS * scale * 0.3))
+    s_arr = np.array(start_color, dtype=np.float32)
+    f_arr = np.array(final_color, dtype=np.float32)
     n = len(traj_px)
-    line_w = max(2, int(R * 0.3))
-    start_arr = np.array(start_color, dtype=np.float32)
-    final_arr = np.array(final_color, dtype=np.float32)
     for i in range(n - 1):
         t = i / max(n - 1, 1)
-        c = (1 - t) * start_arr + t * final_arr
-        rgb = tuple(int(v) for v in c)
-        draw.line(
-            [tuple(traj_px[i]), tuple(traj_px[i + 1])],
-            fill=rgb + (255,), width=line_w,
-        )
+        c = tuple(int(v) for v in (1 - t) * s_arr + t * f_arr)
+        draw.line([tuple(traj_px[i]), tuple(traj_px[i + 1])],
+                  fill=c + (255,), width=line_w)
 
-    # Start/Final/Goal markers already blended onto bg before upscaling
-    # (see _color_blend_ball above), preserving smooth ball edges.
+    pil = pil.convert("RGB")
 
-    # Legend box (bottom-right corner) — explains markers
     if show_legend:
         legend_font = get_font(13, bold=True)
         pad = 8
         line_h = 18
         legend_items = [
-            ((40, 200, 60), "Start"),
-            ((50, 130, 240), "Final"),
-            ((220, 50, 50), "Goal"),
+            (start_color, "Start"),
+            (final_color, "Final"),
+            (goal_color, "Goal"),
         ]
-        max_label_w = max(
-            legend_font.getbbox(label)[2] for _, label in legend_items
-        )
+        max_label_w = max(legend_font.getbbox(label)[2] for _, label in legend_items)
         box_w = 24 + max_label_w + 2 * pad
         box_h = line_h * len(legend_items) + 2 * pad
         box_x = pil.width - box_w - pad
         box_y = pil.height - box_h - pad
-        draw.rectangle([box_x, box_y, box_x + box_w, box_y + box_h],
-                       fill=(0, 0, 0, 180), outline=(255, 255, 255, 200))
+        draw_rgb = ImageDraw.Draw(pil)
+        draw_rgb.rectangle([box_x, box_y, box_x + box_w, box_y + box_h],
+                           fill=(0, 0, 0), outline=(200, 200, 200))
         r = 6
         for i, (color, label) in enumerate(legend_items):
             cy = box_y + pad + i * line_h + line_h // 2
             cx = box_x + pad + 6
-            draw.ellipse([cx - r, cy - r, cx + r, cy + r], fill=color)
-            draw.text((box_x + pad + 18, cy - 7), label,
-                      font=legend_font, fill=(255, 255, 255, 255))
+            draw_rgb.ellipse([cx - r, cy - r, cx + r, cy + r], fill=color)
+            draw_rgb.text((box_x + pad + 18, cy - 7), label,
+                          font=legend_font, fill=(255, 255, 255))
 
-    # If title disabled (e.g. for summary thumbnails), return early
     if not show_title:
         return np.array(pil)
 
-    # Title strip — 4 lines (status / step+pos_dist / MPC / CEM), matching frames.png
+    # title strip
     title_h = 90
     title_color = (0, 160, 0) if success else (200, 0, 0)
     eval_str = f"Eval {eval_idx} — " if eval_idx is not None else ""
@@ -380,19 +429,16 @@ def render_trajectory_plot(env_frames, goal_real, success, bg_img,
         action_len = int(action_len)
         info_parts.append(f"mpc_iters={estimate_mpc_iters(action_len, cfg)}")
         info_parts.append(f"action_len={action_len}")
-    if pos_dist is not None:
-        cmp = "<" if pos_dist < success_thresh else "≥"
-        info_parts.append(f"pos_dist={pos_dist:.2f} {cmp} {success_thresh}")
+    if crit_label is not None:
+        info_parts.append(crit_label)
     info_text = " | ".join(info_parts)
-    _, sub_mpc, sub_cem = (cfg_to_strings(cfg)
-                            if cfg is not None else ("", "", ""))
+    _, sub_mpc, sub_cem = cfg_to_strings(cfg) if cfg is not None else ("", "", "")
 
     final = Image.new("RGB", (pil.width, pil.height + title_h), color=(40, 40, 40))
     final.paste(pil, (0, title_h))
     title_draw = ImageDraw.Draw(final)
     font_status = get_font(16, bold=True)
     font_info = get_font(11)
-    # All 4 lines left-aligned (consistent with MPC/CEM tree structure)
     title_draw.text((10, 4), status_text, font=font_status, fill=title_color)
     if info_text:
         title_draw.text((10, 28), info_text, font=font_info, fill=(200, 200, 200))
@@ -404,42 +450,30 @@ def render_trajectory_plot(env_frames, goal_real, success, bg_img,
     return np.array(final)
 
 
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 # Frames grid (PNG)
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 
 def render_frames_grid(env_frames, wm_frames, goal_real, goal_recon,
                        eval_idx, success, action_len, frameskip,
-                       pos_dist=None, success_thresh=0.5, cfg=None):
-    """
-    Build the 7-column detail PNG: 6 time samples + 1 goal column, 2 rows (env / imagined).
-
-    env_frames: (T*frameskip+1, H, W, 3) uint8  e.g. (26, 224, 224, 3)
-    wm_frames:  (T+1, H, W, 3) uint8            e.g. (6, 224, 224, 3)
-    goal_real:  (H, W, 3) uint8
-    goal_recon: (H, W, 3) uint8
-    """
+                       cfg=None, crit_label=None):
     H, W = env_frames.shape[1:3]
     n_env_frames = env_frames.shape[0]
     n_wm_frames = wm_frames.shape[0]
 
-    # Sample N_TIME_COLUMNS evenly across env time
     env_indices = np.linspace(0, n_env_frames - 1, N_TIME_COLUMNS).astype(int)
-    # Map each env index to nearest wm index
     wm_indices = (env_indices / frameskip).round().clip(0, n_wm_frames - 1).astype(int)
 
-    # Build rows
     env_row = [env_frames[i] for i in env_indices] + [goal_real]
     wm_row = [wm_frames[i] for i in wm_indices] + [goal_recon]
 
-    n_cols = len(env_row)  # 7
+    n_cols = len(env_row)
 
-    # Layout constants
-    label_w = 80        # left-side label column
-    cell_pad = 4        # padding around each cell
-    header_h = 30       # column header
-    title_h = 100       # top title (4 lines: status / step+dist / MPC / CEM)
-    legend_h = 30       # bottom legend
+    label_w = 80
+    cell_pad = 4
+    header_h = 30
+    title_h = 100
+    legend_h = 30
 
     cell_w = W + 2 * cell_pad
     cell_h = H + 2 * cell_pad
@@ -449,7 +483,6 @@ def render_frames_grid(env_frames, wm_frames, goal_real, goal_recon,
 
     canvas = np.full((total_h, total_w, 3), COLOR_BG, dtype=np.uint8)
 
-    # Draw title (4 lines: status / step+pos_dist / MPC / CEM)
     status_color = COLOR_SUCCESS if success else COLOR_FAILURE
     status_text = f"Eval {eval_idx} — {'SUCCESS' if success else 'FAILURE'}"
     action_len = int(action_len)
@@ -457,13 +490,11 @@ def render_frames_grid(env_frames, wm_frames, goal_real, goal_recon,
         f"mpc_iters={estimate_mpc_iters(action_len, cfg)}",
         f"action_len={action_len}",
     ]
-    if pos_dist is not None:
-        cmp = "<" if pos_dist < success_thresh else "≥"
-        step_parts.append(f"pos_dist = {pos_dist:.2f} {cmp} {success_thresh}")
+    if crit_label is not None:
+        step_parts.append(crit_label)
     step_info = "  |  ".join(step_parts)
 
-    _, sub_mpc, sub_cem = (cfg_to_strings(cfg)
-                            if cfg is not None else ("", "", ""))
+    _, sub_mpc, sub_cem = cfg_to_strings(cfg) if cfg is not None else ("", "", "")
 
     pil = Image.fromarray(canvas)
     draw = ImageDraw.Draw(pil)
@@ -481,7 +512,6 @@ def render_frames_grid(env_frames, wm_frames, goal_real, goal_recon,
     if sub_cem:
         draw.text((16, 68), sub_cem, font=font_sub, fill=(180, 180, 180))
 
-    # Column headers
     header_y = title_h
     draw.rectangle([0, header_y, total_w, header_y + header_h], fill=COLOR_PANEL_BG)
     for ci, env_idx in enumerate(env_indices):
@@ -490,29 +520,24 @@ def render_frames_grid(env_frames, wm_frames, goal_real, goal_recon,
         bbox = draw.textbbox((0, 0), text, font=font_header)
         tw = bbox[2] - bbox[0]
         draw.text((x + (W - tw) // 2, header_y + 8), text, font=font_header, fill=COLOR_TEXT)
-    # Goal column header
     x = label_w + N_TIME_COLUMNS * cell_w + cell_pad
     bbox = draw.textbbox((0, 0), "Goal", font=font_header)
     tw = bbox[2] - bbox[0]
     draw.text((x + (W - tw) // 2, header_y + 8), "Goal", font=font_header, fill=COLOR_TEXT)
 
-    # Row labels
     for ri, label in enumerate(["Env (MuJoCo)", "Imagined (WM)"]):
         y = title_h + header_h + ri * cell_h + cell_h // 2
-        # multi-line
         for li, ln in enumerate(label.split()):
             draw.text((8, y - 10 + li * 14), ln, font=font_label, fill=COLOR_TEXT)
 
     canvas = np.array(pil)
 
-    # Place images
     for ri, row in enumerate([env_row, wm_row]):
         for ci, img in enumerate(row):
             y0 = title_h + header_h + ri * cell_h + cell_pad
             x0 = label_w + ci * cell_w + cell_pad
             canvas[y0:y0 + H, x0:x0 + W] = img
 
-    # Bottom legend
     pil = Image.fromarray(canvas)
     draw = ImageDraw.Draw(pil)
     legend_y = total_h - legend_h
@@ -527,122 +552,89 @@ def render_frames_grid(env_frames, wm_frames, goal_real, goal_recon,
     return np.array(pil)
 
 
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 # Annotated video (MP4)
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 
-def render_video(env_frames, wm_frames, goal_real, goal_recon,
+def render_video(env_frames, wm_frames, goal_real, env_bg,
                  eval_idx, success, action_len, frameskip, out_path, fps=12,
-                 pos_dist=None, success_thresh=0.5, cfg=None):
-    """
-    Build annotated mp4 video.
-
-    env_frames: (T*frameskip+1, H, W, 3) uint8
-    wm_frames:  (T+1, H, W, 3) uint8
-    """
+                 cfg=None, crit_label=None):
     n_env_frames = env_frames.shape[0]
     H, W = env_frames.shape[1:3]
+    # Goal mask comes from the real env render — same pixel position works
+    # for both panels since the camera/layout is identical.
 
     status_text = f"Eval {eval_idx} — {'SUCCESS' if success else 'FAILURE'}"
     status_color = COLOR_SUCCESS if success else COLOR_FAILURE
-    # Static info split into 2 lines for readability
     action_len = int(action_len)
     stats_line1 = f"mpc_iters={estimate_mpc_iters(action_len, cfg)} | action_len={action_len}"
-    if pos_dist is not None:
-        cmp = "<" if pos_dist < success_thresh else "≥"
-        dist_line = f"pos_dist = {pos_dist:.2f} {cmp} {success_thresh}"
-    else:
-        dist_line = ""
+    dist_line = crit_label if crit_label is not None else ""
 
-    # Top banner: 4 lines — status (large) / frame counter (dynamic) / stats / pos_dist
-    status_h = 22  # large status line
-    frame_h = 16   # dynamic frame counter
-    stats_h = 16   # static stats (mpc_iters + action_len)
-    dist_h = 16    # static pos_dist
+    status_h = 22
+    frame_h = 16
+    stats_h = 16
+    dist_h = 16
     top_banner_h = status_h + frame_h + stats_h + dist_h
     mid_banner_h = 20
 
-    panel_w = W
-    panel_h = H
-
-    # No side padding — canvas width = panel width
     total_w = W
-    panel_x_offset = 0
-    total_h = top_banner_h + panel_h + mid_banner_h + panel_h
+    total_h = top_banner_h + H + mid_banner_h + H
 
-    # Auto-fit status font: shrink size until status_text fits in video width.
-    # status_text can grow when --per-iter adds "[K/N]" to eval_idx.
-    from PIL import ImageDraw as _ImageDraw, Image as _Image
-    _probe = _ImageDraw.Draw(_Image.new("RGB", (1, 1)))
+    _probe = ImageDraw.Draw(Image.new("RGB", (1, 1)))
     font_status = get_font(15, bold=True)
     for _sz in (15, 13, 12, 11, 10):
         font_status = get_font(_sz, bold=True)
         bbox = _probe.textbbox((0, 0), status_text, font=font_status)
-        if bbox[2] - bbox[0] <= total_w - 8:  # 8px margin
+        if bbox[2] - bbox[0] <= total_w - 8:
             break
     font_top = get_font(10)
     font_mid = get_font(9)
 
-    # Precompute clean backgrounds (median over time → ball-free maze)
-    env_clean = compute_clean_bg(env_frames)
-    wm_clean = compute_clean_bg(wm_frames)
+    n_preds = wm_frames.shape[0] - 1
 
     writer = imageio.get_writer(out_path, fps=fps)
 
-    # Total number of WM predictions = wm_frames - 1 (frame 0 is recon, not pred)
-    n_preds = wm_frames.shape[0] - 1
-
     for t in range(n_env_frames):
-        # Imagined frame index (every frameskip env frames, hold in between)
         i_idx = min(t // frameskip, wm_frames.shape[0] - 1)
-        # pred 0 = reconstruction; pred 1..n_preds = forward predictions
         pred_segment = min(t // frameskip, n_preds)
 
-        # Diff-based overlay: keeps current frame intact, adds goal-ball signal as ghost.
-        env_panel = overlay_goal_ghost(env_frames[t], goal_real, env_clean)
-        wm_panel = overlay_goal_ghost(wm_frames[i_idx], goal_recon, wm_clean)
+        env_panel = blend_ball_marker(env_frames[t], goal_real, env_bg,
+                                      color=(255, 50, 50), alpha=0.7)
+        wm_panel = blend_ball_marker(wm_frames[i_idx], goal_real, env_bg,
+                                     color=(255, 50, 50), alpha=0.7)
 
-        # Compose canvas
         canvas = np.full((total_h, total_w, 3), COLOR_BG, dtype=np.uint8)
 
-        # Top banner — 4 lines: status (large, prominent) / frame (dynamic) / stats / dist
         canvas[0:top_banner_h] = COLOR_PANEL_BG
         pil = Image.fromarray(canvas)
         draw = ImageDraw.Draw(pil)
 
-        # Line 1: status (large, colored)
         bbox = draw.textbbox((0, 0), status_text, font=font_status)
         tw = bbox[2] - bbox[0]
         draw.text(((total_w - tw) // 2, 3), status_text,
                   font=font_status, fill=status_color)
 
-        # Line 2: dynamic frame counter
         frame_text = f"Frame {t}/{n_env_frames - 1} | pred {pred_segment}/{n_preds}"
         bbox = draw.textbbox((0, 0), frame_text, font=font_top)
         tw = bbox[2] - bbox[0]
         draw.text(((total_w - tw) // 2, status_h + 1), frame_text,
                   font=font_top, fill=COLOR_TEXT)
 
-        # Line 3: static stats (mpc_iters + action_len)
         bbox = draw.textbbox((0, 0), stats_line1, font=font_top)
         tw = bbox[2] - bbox[0]
         draw.text(((total_w - tw) // 2, status_h + frame_h + 1), stats_line1,
                   font=font_top, fill=(200, 200, 200))
 
-        # Line 4: pos_dist (static)
         if dist_line:
             bbox = draw.textbbox((0, 0), dist_line, font=font_top)
             tw = bbox[2] - bbox[0]
             draw.text(((total_w - tw) // 2, status_h + frame_h + stats_h + 1),
                       dist_line, font=font_top, fill=(200, 200, 200))
 
-        # Env panel (centered)
         canvas = np.array(pil)
-        canvas[top_banner_h:top_banner_h + panel_h,
-               panel_x_offset:panel_x_offset + panel_w] = env_panel
+        canvas[top_banner_h:top_banner_h + H, 0:W] = env_panel
 
-        # Mid banner (label between env and imag)
-        y_mid = top_banner_h + panel_h
+        y_mid = top_banner_h + H
         canvas[y_mid:y_mid + mid_banner_h] = COLOR_PANEL_BG
         pil = Image.fromarray(canvas)
         draw = ImageDraw.Draw(pil)
@@ -651,63 +643,69 @@ def render_video(env_frames, wm_frames, goal_real, goal_recon,
         mw = bbox[2] - bbox[0]
         draw.text(((total_w - mw) // 2, y_mid + 4), mid_text, font=font_mid, fill=COLOR_TEXT)
 
-        # Imag panel (centered)
         canvas = np.array(pil)
         y_imag = y_mid + mid_banner_h
-        canvas[y_imag:y_imag + panel_h,
-               panel_x_offset:panel_x_offset + panel_w] = wm_panel
+        canvas[y_imag:y_imag + H, 0:W] = wm_panel
 
         writer.append_data(canvas)
 
     writer.close()
 
 
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 # Summary PNG
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 
-def render_summary(run_dir, cfg, meta, visuals, out_path,
-                   env_bgs, env_frames_all, goal_real_all, ball_radius_px,
-                   pos_dists=None, success_thresh=0.5):
-    """Render summary.png: trajectory plots for all evals + status info."""
+def render_summary(run_dir, cfg, meta, out_path,
+                   env_bgs, env_frames_all, goal_real_all,
+                   px_scale, px_offset,
+                   crit_fn=None,
+                   start_color=(40, 200, 60)):
     e_states = meta["e_states"]
     successes = meta["successes"]
     action_len = meta["action_len"]
+    state_g = meta["state_g"]
     n_evals = e_states.shape[0]
+    frameskip = cfg.get("frameskip", 5)
 
-    # Generate trajectory plot per eval (returns numpy image)
+    def _final_idx(i):
+        return min(int(action_len[i]) * frameskip + 1, e_states.shape[1]) - 1
+
+    crit_labels = [
+        crit_fn(e_states[i, _final_idx(i)], state_g[i]) if crit_fn else None
+        for i in range(n_evals)
+    ]
+
     traj_imgs = []
     for i in range(n_evals):
-        n_frames = int(action_len[i]) * cfg.get("frameskip", 5) + 1
-        n_frames = min(n_frames, env_frames_all.shape[1])
-        pd = pos_dists[i] if pos_dists is not None else None
+        n_frames = min(int(action_len[i]) * frameskip + 1, e_states.shape[1])
         traj_img = render_trajectory_plot(
-            env_frames=env_frames_all[i, :n_frames],
-            goal_real=goal_real_all[i, 0],
+            e_states=e_states[i, :n_frames],
+            state_g=state_g[i],
             success=successes[i],
             bg_img=env_bgs[i],
-            ball_radius_px=ball_radius_px, scale=1,
+            start_frame=env_frames_all[i, 0],
+            final_frame=env_frames_all[i, n_frames - 1],
+            goal_frame=goal_real_all[i],
+            px_scale=px_scale, px_offset=px_offset, scale=1,
             eval_idx=i, action_len=action_len[i],
-            pos_dist=pd, success_thresh=success_thresh,
-            frameskip=cfg.get("frameskip", 5),
+            cfg=cfg, start_color=start_color, crit_label=crit_labels[i],
             show_title=False, show_legend=False,
         )
         traj_imgs.append(traj_img)
 
     traj_H, traj_W = traj_imgs[0].shape[:2]
 
-    # Layout — title now has 4 lines (result, task, MPC, CEM-indented)
     title_h = 80
     legend_h = 24
     info_w = 190
     row_h = traj_H
-    min_title_w = 460  # enough for CEM line at font 10 (full param names)
+    min_title_w = 460
     total_w = max(traj_W + info_w, min_title_w)
     total_h = title_h + legend_h + n_evals * row_h
 
     canvas = np.full((total_h, total_w, 3), COLOR_BG, dtype=np.uint8)
 
-    # 4-line title: result | task | MPC | CEM (indented under MPC)
     n_success = int(successes.sum())
     success_rate = n_success / n_evals
     title = f"Planning Summary — {n_success}/{n_evals} success ({success_rate * 100:.1f}%)"
@@ -726,9 +724,8 @@ def render_summary(run_dir, cfg, meta, visuals, out_path,
     draw.text((12, 44), sub2, font=font_sub, fill=(180, 180, 180))
     draw.text((12, 60), sub3, font=font_sub, fill=(180, 180, 180))
 
-    # Global legend strip (horizontal, below title) — applies to all eval thumbnails
     legend_items = [
-        ((40, 200, 60), "Start"),
+        (start_color, "Start"),
         ((50, 130, 240), "Final"),
         ((220, 50, 50), "Goal"),
     ]
@@ -745,13 +742,10 @@ def render_summary(run_dir, cfg, meta, visuals, out_path,
 
     canvas = np.array(pil)
 
-    # Per-eval rows
     for i in range(n_evals):
         y0 = title_h + legend_h + i * row_h
-        # Trajectory image
         canvas[y0:y0 + traj_H, 0:traj_W] = traj_imgs[i]
 
-        # Info panel
         pil = Image.fromarray(canvas)
         draw = ImageDraw.Draw(pil)
         status_text = "✓ SUCCESS" if successes[i] else "✗ FAILURE"
@@ -766,12 +760,8 @@ def render_summary(run_dir, cfg, meta, visuals, out_path,
             (f"mpc_iters = {estimate_mpc_iters(action_len_i, cfg)}", font_info, COLOR_TEXT),
             (f"action_len = {action_len_i}", font_info, COLOR_TEXT),
         ]
-        if pos_dists is not None:
-            cmp = "<" if pos_dists[i] < success_thresh else "≥"
-            lines.append((
-                f"pos_dist = {pos_dists[i]:.2f} {cmp} {success_thresh}",
-                font_info, COLOR_TEXT,
-            ))
+        if crit_labels[i] is not None:
+            lines.append((crit_labels[i], font_info, COLOR_TEXT))
         for li, (txt, font, color) in enumerate(lines):
             draw.text((info_x, info_y + li * 22), txt, font=font, fill=color)
 
@@ -780,9 +770,9 @@ def render_summary(run_dir, cfg, meta, visuals, out_path,
     Image.fromarray(canvas).save(out_path)
 
 
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 # Main
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 
 def main(run_dir: str, per_iter: bool = False):
     run_dir = Path(run_dir).resolve()
@@ -790,52 +780,65 @@ def main(run_dir: str, per_iter: bool = False):
         raise FileNotFoundError(f"Run dir not found: {run_dir}")
 
     print(f"Processing: {run_dir}")
-    cfg, meta, visuals, evals_data = load_run(run_dir)
+    cfg, meta, latents, evals_data = load_run(run_dir)
 
     n_evals = meta["e_states"].shape[0]
     frameskip = cfg.get("frameskip", 5)
     print(f"  n_evals = {n_evals}, frameskip = {frameskip}")
 
-    # Real goal frames (env-rendered): obs_g['visual'] is now flat in visuals
-    goal_real_all = visuals["obs_g"]                              # (n, 1, H, W, 3) uint8
+    # --- Setup: load decoder, env, calibrate coordinates ---
+    print("  Loading decoder and env ...")
+    train_cfg = load_train_cfg(cfg)
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    decoder = load_decoder(cfg, device)
+    the_env = create_render_env(cfg, train_cfg)
+    px_scale, px_offset = calibrate_state_to_pixel(the_env)
 
-    env_frames_all = visuals["env_frames"]                        # (n, T*f+1, H, W, 3) uint8
-    # Assemble the WM row: obs_0 reconstruction + forward imaginations → (n, T+1, 3, H, W)
-    wm_frames_all = np.concatenate(
-        [visuals["wm_obs_0_recon"], visuals["wm_imagined"]], axis=1
-    )                                                              # (n, T+1, 3, H, W) uint8
-    goal_recon_all = visuals["wm_obs_g_recon"]                    # (n, 1, 3, H, W) uint8
+    # --- Generate pixel data from latents and states ---
+    print("  Rendering env frames ...")
+    env_frames_all = render_env_frames(the_env, meta["e_states"])
+    goal_real_all = np.stack([
+        render_single_frame(the_env, meta["state_g"][i]) for i in range(n_evals)
+    ])
+    # Single clean bg (rendered with ball hidden) shared across all evals —
+    # the maze itself doesn't vary per eval, only the ball trajectory does.
+    env_bg = render_clean_bg(the_env)
+    env_bgs = np.tile(env_bg[None], (n_evals, 1, 1, 1))
+
+    # Start marker color = actual ball color (so the variant is visible at a
+    # glance in trajectory.png). Read directly from the env's particle_site rgba.
+    raw = the_env.unwrapped
+    site_id = raw.model.site_name2id("particle_site")
+    start_color = tuple(int(c * 255) for c in raw.model.site_rgba[site_id, :3])
+
+    # Per-run preview.png — env + ball at eval 0's starting position. No
+    # trajectory/markers; lets the dashboard show variant appearance (ball
+    # color + wall/floor colors) at a glance without any trajectory clutter.
+    preview = render_single_frame(the_env, meta["e_states"][0, 0])
+    Image.fromarray(preview).save(run_dir / "preview.png")
+    print(f"  Saved preview.png")
+
+    print("  Decoding WM latents ...")
+    wm_frames_all, goal_recon_all = generate_wm_frames(decoder, latents, device)
 
     successes = meta["successes"]
     action_len = meta["action_len"]
+    state_g = meta["state_g"]
 
-    # Pre-compute per-eval clean MuJoCo backgrounds (median over frames → ball-free)
-    env_bgs_all = np.stack([
-        compute_clean_bg(env_frames_all[i]) for i in range(n_evals)
-    ])  # (n_evals, H, W, 3)
-
-    # Estimate the actual ball radius (in pixels) for sizing markers
-    ball_radius_px = estimate_ball_radius_px(env_frames_all)
-    print(f"  Estimated ball radius: {ball_radius_px:.1f} px")
-
-    # Pull per-eval pos_dist directly from evals.json (last iter the eval went through
-    # = the eval's effective stopping point). No on-the-fly state-slicing needed.
-    pos_dists = np.array([
-        evals_data["evals"][str(i)]["iters"][-1]["pos_dist"]
-        for i in range(n_evals)
-    ])
-    # Success threshold is env-specific and not in evals.json (which only has the
-    # bool success). Looked up here so titles can show "pos_dist X < thresh".
-    success_thresh = SUCCESS_THRESH.get(cfg.get("model_name"), 0.5)
+    # reach threshold comes from the env itself (REACH_THRESH on its wrapper),
+    # so the label can't drift from the env's actual eval_state.
+    reach_thresh = getattr(the_env.unwrapped, "REACH_THRESH", 0.5)
+    crit_fn = make_crit_label_fn(cfg, reach_thresh)  # one source for the label
 
     # --- Summary ---
     print("  Rendering summary.png ...")
     summary_path = run_dir / "summary.png"
-    render_summary(run_dir, cfg, meta, visuals, summary_path,
-                   env_bgs=env_bgs_all, env_frames_all=env_frames_all,
+    render_summary(run_dir, cfg, meta, summary_path,
+                   env_bgs=env_bgs, env_frames_all=env_frames_all,
                    goal_real_all=goal_real_all,
-                   ball_radius_px=ball_radius_px,
-                   pos_dists=pos_dists, success_thresh=success_thresh)
+                   px_scale=px_scale, px_offset=px_offset,
+                   crit_fn=crit_fn,
+                   start_color=start_color)
     print(f"    saved {summary_path}")
 
     # --- Per-eval outputs ---
@@ -847,29 +850,26 @@ def main(run_dir: str, per_iter: bool = False):
         eval_dir.mkdir(exist_ok=True)
         print(f"  Eval {i} ({'success' if successes[i] else 'failure'}) ...")
 
-        # Prepare per-eval data
-        env_frames = env_frames_all[i]                            # (T*f+1, H, W, 3)
-        wm_frames = np.stack([chw_to_hwc(f) for f in wm_frames_all[i]])  # (T+1, H, W, 3)
-        goal_real = goal_real_all[i, 0]                           # (H, W, 3)
-        goal_recon = chw_to_hwc(goal_recon_all[i, 0])             # (H, W, 3)
-
-        # Trim frames to the per-eval action length.
         n_env = int(action_len[i]) * frameskip + 1
-        n_env = min(n_env, env_frames.shape[0])
-        n_wm = min(int(action_len[i]) + 1, wm_frames.shape[0])
-        env_frames = env_frames[:n_env]
-        wm_frames = wm_frames[:n_wm]
+        n_env = min(n_env, env_frames_all.shape[1])
+        n_wm = min(int(action_len[i]) + 1, wm_frames_all.shape[1])
+        env_frames = env_frames_all[i, :n_env]
+        wm_frames = wm_frames_all[i, :n_wm]
+        goal_real = goal_real_all[i]
+        goal_recon = goal_recon_all[i, 0]
+
+        e_states_i = meta["e_states"][i, :n_env]
+        crit_i = crit_fn(e_states_i[-1], state_g[i])
 
         # --- trajectory.png ---
-        n_traj = env_frames.shape[0]
         traj_img = render_trajectory_plot(
-            env_frames=env_frames, goal_real=goal_real,
-            success=successes[i],
-            bg_img=env_bgs_all[i],
-            ball_radius_px=ball_radius_px, scale=2,
+            e_states=e_states_i, state_g=state_g[i],
+            success=successes[i], bg_img=env_bgs[i],
+            start_frame=env_frames[0], final_frame=env_frames[-1],
+            goal_frame=goal_real,
+            px_scale=px_scale, px_offset=px_offset, scale=2,
             eval_idx=i, action_len=action_len[i],
-            pos_dist=pos_dists[i], success_thresh=success_thresh,
-            frameskip=frameskip, cfg=cfg,
+            cfg=cfg, start_color=start_color, crit_label=crit_i,
         )
         Image.fromarray(traj_img).save(eval_dir / "trajectory.png")
 
@@ -878,60 +878,54 @@ def main(run_dir: str, per_iter: bool = False):
             env_frames, wm_frames, goal_real, goal_recon,
             eval_idx=i, success=successes[i],
             action_len=action_len[i], frameskip=frameskip,
-            pos_dist=pos_dists[i], success_thresh=success_thresh,
-            cfg=cfg,
+            cfg=cfg, crit_label=crit_i,
         )
         Image.fromarray(frames_img).save(eval_dir / "frames.png")
 
         # --- video.mp4 ---
         render_video(
-            env_frames, wm_frames, goal_real, goal_recon,
+            env_frames, wm_frames, goal_real, env_bgs[i],
             eval_idx=i, success=successes[i],
             action_len=action_len[i], frameskip=frameskip,
             out_path=str(eval_dir / "video.mp4"),
-            pos_dist=pos_dists[i], success_thresh=success_thresh,
-            cfg=cfg,
+            cfg=cfg, crit_label=crit_i,
         )
 
-        # --- per-iter cumulative snapshots (optional) ---
+        # --- per-iter snapshots (optional) ---
         if per_iter:
             n_taken_cfg = (cfg.get("planner", {}) or {}).get("n_taken_actions")
             if n_taken_cfg is None:
-                # Non-MPC: only one "iter" exists; skip (full viz already covers it)
                 continue
             n_taken_int = int(n_taken_cfg)
-            # Use the full (un-trimmed) per-eval arrays for slicing
             env_full = env_frames_all[i]
-            wm_full = np.stack([chw_to_hwc(f) for f in wm_frames_all[i]])
+            wm_full = wm_frames_all[i]
             actual_iters = max(1, int(np.ceil(int(action_len[i]) / n_taken_int)))
 
             iters_data = evals_data["evals"][str(i)]["iters"]
             for k in range(actual_iters):
-                env_end = (k + 1) * n_taken_int * frameskip + 1
-                env_end = min(env_end, env_full.shape[0])
-                wm_end = (k + 1) * n_taken_int + 1
-                wm_end = min(wm_end, wm_full.shape[0])
+                env_end = min((k + 1) * n_taken_int * frameskip + 1, env_full.shape[0])
+                wm_end = min((k + 1) * n_taken_int + 1, wm_full.shape[0])
                 env_k = env_full[:env_end]
                 wm_k = wm_full[:wm_end]
+                e_states_k = meta["e_states"][i, :env_end]
 
-                # Read iter-k metrics from evals.json (already cap-adjusted in plan.py)
                 iter_metrics = iters_data[k]
                 action_len_k = min(int(action_len[i]), (k + 1) * n_taken_int)
                 success_k = iter_metrics["success"]
-                pos_dist_k = iter_metrics["pos_dist"]
                 iter_label = f"{i} [{k + 1}/{actual_iters}]"
+                crit_k = crit_fn(e_states_k[-1], state_g[i])
 
                 iter_dir = eval_dir / f"iter_{k + 1}"
                 iter_dir.mkdir(exist_ok=True)
 
                 traj_img = render_trajectory_plot(
-                    env_frames=env_k, goal_real=goal_real,
-                    success=success_k,
-                    bg_img=env_bgs_all[i],
-                    ball_radius_px=ball_radius_px, scale=2,
+                    e_states=e_states_k, state_g=state_g[i],
+                    success=success_k, bg_img=env_bgs[i],
+                    start_frame=env_k[0], final_frame=env_k[-1],
+                    goal_frame=goal_real,
+                    px_scale=px_scale, px_offset=px_offset, scale=2,
                     eval_idx=iter_label, action_len=action_len_k,
-                    pos_dist=pos_dist_k, success_thresh=success_thresh,
-                    frameskip=frameskip, cfg=cfg,
+                    cfg=cfg, start_color=start_color, crit_label=crit_k,
                 )
                 Image.fromarray(traj_img).save(iter_dir / "trajectory.png")
 
@@ -939,18 +933,16 @@ def main(run_dir: str, per_iter: bool = False):
                     env_k, wm_k, goal_real, goal_recon,
                     eval_idx=iter_label, success=success_k,
                     action_len=action_len_k, frameskip=frameskip,
-                    pos_dist=pos_dist_k, success_thresh=success_thresh,
-                    cfg=cfg,
+                    cfg=cfg, crit_label=crit_k,
                 )
                 Image.fromarray(frames_img).save(iter_dir / "frames.png")
 
                 render_video(
-                    env_k, wm_k, goal_real, goal_recon,
+                    env_k, wm_k, goal_real, env_bgs[i],
                     eval_idx=iter_label, success=success_k,
                     action_len=action_len_k, frameskip=frameskip,
                     out_path=str(iter_dir / "video.mp4"),
-                    pos_dist=pos_dist_k, success_thresh=success_thresh,
-                    cfg=cfg,
+                    cfg=cfg, crit_label=crit_k,
                 )
 
     print("Done.")
@@ -965,9 +957,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--per-iter",
         action="store_true",
-        help="Also generate cumulative per-iter snapshots "
-             "(eval_N/iter_K/{trajectory,frames,video}). Each iter K shows "
-             "the trajectory from t=0 up to the end of MPC iter K.",
+        help="Also generate cumulative per-iter snapshots.",
     )
     args = parser.parse_args()
     main(args.run_dir, per_iter=args.per_iter)

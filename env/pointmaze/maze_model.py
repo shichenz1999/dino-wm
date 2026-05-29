@@ -11,6 +11,9 @@ WALL = 10
 EMPTY = 11
 GOAL = 12
 
+BALL_RADIUS = 0.2       # ball's VISUAL radius (particle site size, rendered)
+COLLISION_RADIUS = 0.1  # ball's PHYSICS radius (particle geom; used for erosion)
+
 
 def parse_maze(maze_str):
     lines = maze_str.strip().split('\\')
@@ -30,7 +33,11 @@ def parse_maze(maze_str):
     return maze_arr
 
 
-def point_maze(maze_str):
+def point_maze(maze_str,
+               ball_rgba='0.3 0.6 0.3 1',
+               wall_rgba='.7 .5 .3 1',
+               floor_rgb1='0.2 0.3 0.4',
+               floor_rgb2='0.1 0.2 0.3'):
     maze_arr = parse_maze(maze_str)
 
     mjcmodel = MJCModel('point_maze')
@@ -41,11 +48,11 @@ def point_maze(maze_str):
     default.geom(friction=".5 .1 .1", density="1000", margin="0.002", condim="1", contype="2", conaffinity="1")
 
     asset = mjcmodel.root.asset()
-    asset.texture(type="2d",name="groundplane",builtin="checker",rgb1="0.2 0.3 0.4",rgb2="0.1 0.2 0.3",width=100,height=100)
+    asset.texture(type="2d",name="groundplane",builtin="checker",rgb1=floor_rgb1,rgb2=floor_rgb2,width=100,height=100)
     asset.texture(name="skybox",type="skybox",builtin="gradient",rgb1=".4 .6 .8",rgb2="0 0 0",
                width="800",height="800",mark="random",markrgb="1 1 1")
     asset.material(name="groundplane",texture="groundplane",texrepeat="20 20")
-    asset.material(name="wall",rgba=".7 .5 .3 1")
+    asset.material(name="wall",rgba=wall_rgba)
     asset.material(name="target",rgba=".6 .3 .3 1")
 
     visual = mjcmodel.root.visual()
@@ -57,8 +64,8 @@ def point_maze(maze_str):
     worldbody.geom(name='ground',size="40 40 0.25",pos="0 0 -0.1",type="plane",contype=1,conaffinity=0,material="groundplane")
 
     particle = worldbody.body(name='particle', pos=[1.2,1.2,0])
-    particle.geom(name='particle_geom', type='sphere', size=0.1, rgba='0.0 0.0 1.0 0.0', contype=1)
-    particle.site(name='particle_site', pos=[0.0,0.0,0], size=0.2, rgba='0.3 0.6 0.3 1')
+    particle.geom(name='particle_geom', type='sphere', size=COLLISION_RADIUS, rgba='0.0 0.0 1.0 0.0', contype=1)
+    particle.site(name='particle_site', pos=[0.0,0.0,0], size=BALL_RADIUS, rgba=ball_rgba)
     particle.joint(name='ball_x', type='slide', pos=[0,0,0], axis=[1,0,0])
     particle.joint(name='ball_y', type='slide', pos=[0,0,0], axis=[0,1,0])
 
@@ -171,6 +178,10 @@ class MazeEnv(mujoco_env.MujocoEnv, utils.EzPickle, offline_env.OfflineEnv):
                  reset_target=True,
                  return_value='state', # 'obs' or 'state'
                  with_target= False,
+                 ball_rgba='0.3 0.6 0.3 1',
+                 wall_rgba='.7 .5 .3 1',
+                 floor_rgb1='0.2 0.3 0.4',
+                 floor_rgb2='0.1 0.2 0.3',
                  **kwargs):
         offline_env.OfflineEnv.__init__(self, **kwargs)
         self.with_target = with_target
@@ -183,8 +194,12 @@ class MazeEnv(mujoco_env.MujocoEnv, utils.EzPickle, offline_env.OfflineEnv):
 
         self._target = np.array([0.0,0.0])
         self.return_value = return_value
-                
-        model = point_maze(maze_spec)
+
+        model = point_maze(maze_spec,
+                           ball_rgba=ball_rgba,
+                           wall_rgba=wall_rgba,
+                           floor_rgb1=floor_rgb1,
+                           floor_rgb2=floor_rgb2)
         with model.asfile() as f:
             mujoco_env.MujocoEnv.__init__(self, model_path=f.name, frame_skip=5)
         utils.EzPickle.__init__(self)

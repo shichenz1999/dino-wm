@@ -303,3 +303,7 @@ register(
         'ref_max_score': 1.0,
     }
 )
+
+from . import color_variants  # noqa: F401  (registers color generalization variants)
+from . import task_variants   # noqa: F401  (registers task-flip variants)
+

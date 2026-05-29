@@ -52,13 +52,15 @@ resize_transform = transforms.Resize((224, 224))
 TRANSFORM = resize_transform
     
 class WallEnvWrapper(DotWall):
+    REACH_THRESH = 4.5  # reach success: pos_dist < this (single source)
+
     def __init__(self, rng=42, wall_config=DEFAULT_CFG, fix_wall=True, cross_wall=False, fix_wall_location=32, fix_door_location=10, device='cpu', **kwargs):
         super().__init__(rng, wall_config, fix_wall, cross_wall, fix_wall_location=fix_wall_location, fix_door_location=fix_door_location, device=device,**kwargs)
         self.action_dim = ENV_ACTION_DIM
         self.transform = TRANSFORM
 
     def eval_state(self, goal_state, cur_state):
-        success = np.linalg.norm(goal_state[:2] - cur_state[:2]) < 4.5 
+        success = np.linalg.norm(goal_state[:2] - cur_state[:2]) < self.REACH_THRESH
         state_dist = np.linalg.norm(goal_state - cur_state)
         return {
             'success': success,
