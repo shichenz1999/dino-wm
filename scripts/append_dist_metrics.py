@@ -2,11 +2,13 @@
 """Post-process a plan_outputs/<run>/ dir: compute per-iter, per-step
 distance-to-goal curves in four spaces and append them to evals.json.
 
-Per eval i, per iter k (matching evals[i]["iters"]), per step j=1..n_taken:
-    global wm step g = k*n_taken + j   ->   env step = g*frameskip
+Per eval i, per iter k (matching evals[i]["iters"]):
+  Distances are per-frame — sampled at every env step in the iter
+  (n_taken*frameskip points):
     pixel_dist_steps          : ||obs_step - obs_goal||_2  (int32)
     geo_dist_steps            : geodesic dist (eikonal) ball->goal  (point_maze)
     latent_dist_steps         : ||encoder(obs_step) - z_obs_g||_2  (visual, to goal)
+  wm_pred_mse stays per-action (n_taken points; WM predicts one latent/action):
     wm_pred_mse_steps         : mean((imagined_visual - actual_visual)**2)
 
 Bit-exact reproduction of planning's observations (no planner re-run):
@@ -59,12 +61,12 @@ SPEC_MAP = {
 
 
 def load_train_cfg(cfg):
-    model_path = Path(str(cfg.ckpt_base_path)) / "outputs" / str(cfg.model_name)
+    model_path = Path(str(cfg.ckpt_base_path)) / str(cfg.env_name) / str(cfg.ckpt_id)
     return OmegaConf.load(model_path / "hydra.yaml")
 
 
 def load_wm(cfg, train_cfg, device):
-    model_ckpt = (Path(str(cfg.ckpt_base_path)) / "outputs" / str(cfg.model_name)
+    model_ckpt = (Path(str(cfg.ckpt_base_path)) / str(cfg.env_name) / str(cfg.ckpt_id)
                   / "checkpoints" / f"model_{cfg.model_epoch}.pth")
     model = load_model(model_ckpt, train_cfg, train_cfg.num_action_repeat, device)
     model.eval()
@@ -167,19 +169,23 @@ def main(run_dir, in_place=False, sanity=False, max_evals=None):
         field = field_for(maze_spec, state_g[i, :2])
 
         iters = evals["evals"][str(i)]["iters"]
+        n_fine = n_taken * frameskip
         for k, iter_entry in enumerate(iters):
-            est = [min((k * n_taken + j) * frameskip, T_env - 1)
-                   for j in range(1, n_taken + 1)]
-            frames = vis[est]                                  # (n_taken, H, W, C)
+            # distances: every env step (frame) in the iter
+            est = [min(k * n_fine + s, T_env - 1) for s in range(1, n_fine + 1)]
+            frames = vis[est]                                  # (n_fine, H, W, C)
 
             pix = np.linalg.norm(
                 frames.reshape(len(est), -1).astype(np.int32) - vg, axis=-1)
             geo = np.array([field.distance(states[s, :2]) for s in est])
 
-            z_act = encode_visual(wm, transform, frames, device)   # (n_taken, P, D)
+            z_act = encode_visual(wm, transform, frames, device)   # (n_fine, P, D)
             lat = (z_act - zg_i).flatten(1).norm(dim=1).numpy()
+            # wm_mse: per-action — subsample action-boundary frames from z_act
+            act_cols = [frameskip * j - 1 for j in range(1, n_taken + 1)]
+            z_act_a = z_act[act_cols]                              # (n_taken, P, D)
             z_img = rollout[k]["visual"][i, 1:n_taken + 1]         # (n_taken, P, D)
-            wm_mse = ((z_img - z_act) ** 2).flatten(1).mean(dim=1).numpy()
+            wm_mse = ((z_img - z_act_a) ** 2).flatten(1).mean(dim=1).numpy()
 
             iter_entry["pixel_dist_steps"] = [round(float(x), 3) for x in pix]
             iter_entry["geo_dist_steps"] = [round(float(x), 3) for x in geo]

@@ -71,7 +71,8 @@ def launch_plan_jobs(
 def build_plan_cfg_dicts(
     plan_cfg_path="",
     ckpt_base_path="",
-    model_name="",
+    env_name="",
+    ckpt_id="",
     model_epoch="final",
     planner=["gd", "cem"],
     goal_source=["dset"],
@@ -88,7 +89,8 @@ def build_plan_cfg_dicts(
             "goal_source": g_source,
             "goal_H": g_H,
             "ckpt_base_path": ckpt_base_path,
-            "model_name": model_name,
+            "env_name": env_name,
+            "ckpt_id": ckpt_id,
             "model_epoch": model_epoch,
             "objective": {"alpha": a},
         }
@@ -452,25 +454,29 @@ class PlanWorkspace:
         return metrics
 
     def _per_iter_step_arrays(self, k, n_taken, action_len_int, e_obses, e_states):
-        """Per-step distance-to-goal curves for iter k: {metric: (n_evals, n_taken)}.
+        """Per-frame distance-to-goal curves for iter k.
 
-        step j=1..n_taken -> env step (k*n_taken+j)*frameskip, capped at each
-        eval's executed length. Uses the real in-memory obs (e_obses) and goal
-        (obs_g), so values are bit-exact to planning -- no replay/rendering. The
-        actual visual latent is encoded once and shared by latent_dist + wm_mse.
-        Means/normalization/correlations are left to downstream consumers.
+        Distances (pixel/geo/latent) are sampled at EVERY env step in the iter
+        (n_taken*frameskip points) -- the finest resolution e_obses/e_states
+        hold. wm_pred_mse stays per-action (n_taken points): the WM only
+        predicts one latent per action, so prediction error is only defined at
+        action boundaries. The per-frame visual latent is encoded once; the
+        action-boundary frames are subsampled from it for wm_mse (no re-encode).
+        Uses real in-memory obs/goal -> bit-exact. Means/normalization left to
+        downstream consumers.
         """
         n = self.n_evals
         fs = self.frameskip
-        steps = np.arange(1, n_taken + 1)
-        raw = (k * n_taken + steps)[None, :] * fs                  # (1, n_taken)
+        n_fine = n_taken * fs                                       # frames per iter
+        steps = np.arange(1, n_fine + 1)
+        raw = (k * n_fine + steps)[None, :]                        # (1, n_fine) env steps
         cap = np.minimum(action_len_int * fs, e_states.shape[1] - 1)[:, None]
-        est = np.minimum(raw, cap)                                 # (n, n_taken)
+        est = np.minimum(raw, cap)                                 # (n, n_fine)
         ii = np.arange(n)[:, None]
 
         out = {}
         # pixel: ||obs_step - obs_goal|| (int32 cast avoids uint8 wrap-around)
-        v = e_obses["visual"][ii, est].reshape(n, n_taken, -1).astype(np.int32)
+        v = e_obses["visual"][ii, est].reshape(n, n_fine, -1).astype(np.int32)
         vg = self.obs_g["visual"][:, 0].reshape(n, 1, -1).astype(np.int32)
         out["pixel_dist_steps"] = np.linalg.norm(v - vg, axis=-1)
 
@@ -478,30 +484,33 @@ class PlanWorkspace:
         if self.env_name == "point_maze":
             from env.pointmaze.geo_dist import field_for
             maze_spec = self._maze_spec()
-            geo = np.zeros((n, n_taken))
+            geo = np.zeros((n, n_fine))
             for i in range(n):
                 field = field_for(maze_spec, self.state_g[i, :2])
-                for j in range(n_taken):
+                for j in range(n_fine):
                     geo[i, j] = field.distance(e_states[i, est[i, j], :2])
             out["geo_dist_steps"] = geo
 
-        # actual visual latent at every step (shared by latent_dist + wm_mse)
-        cur_obs = {key: arr[ii, est] for key, arr in e_obses.items()}   # (n, n_taken, ...)
+        # per-frame visual latent (shared: latent_dist uses all, wm_mse subsamples)
+        cur_obs = {key: arr[ii, est] for key, arr in e_obses.items()}   # (n, n_fine, ...)
         trans = move_to_device(
             self.data_preprocessor.transform_obs(cur_obs), self.evaluator.device
         )
         with torch.no_grad():
-            z_act = self.wm.encode_obs(trans)["visual"]                # (n, n_taken, P, D)
+            z_act = self.wm.encode_obs(trans)["visual"]                # (n, n_fine, P, D)
         zg = self._z_obs_g["visual"].to(self.evaluator.device)         # (n, 1, P, D)
         out["latent_dist_steps"] = (
             (z_act - zg).flatten(2).norm(dim=2).cpu().numpy()
         )
+        # wm_mse: compare imagined (per-action) vs actual at action boundaries
+        act_cols = np.arange(1, n_taken + 1) * fs - 1              # frame idx at each action end
+        z_act_a = z_act[:, act_cols]                               # (n, n_taken, P, D)
         kk = min(k, len(self._rollout_latents) - 1)
         z_img = self._rollout_latents[kk]["visual"][:, 1:n_taken + 1].to(
             self.evaluator.device
         )                                                              # (n, n_taken, P, D)
         out["wm_pred_mse_steps"] = (
-            ((z_img - z_act) ** 2).flatten(2).mean(dim=2).cpu().numpy()
+            ((z_img - z_act_a) ** 2).flatten(2).mean(dim=2).cpu().numpy()
         )
         return out
 
@@ -716,7 +725,7 @@ def planning_main(cfg_dict):
         wandb_run = None
 
     ckpt_base_path = cfg_dict["ckpt_base_path"]
-    model_path = f"{ckpt_base_path}/outputs/{cfg_dict['model_name']}/"
+    model_path = f"{ckpt_base_path}/{cfg_dict['env_name']}/{cfg_dict['ckpt_id']}/"
     with open(os.path.join(model_path, "hydra.yaml"), "r") as f:
         model_cfg = OmegaConf.load(f)
 

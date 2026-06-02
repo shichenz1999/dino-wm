@@ -5,9 +5,9 @@ defaults:
 
 hydra:
   run:
-    dir: plan_outputs/${now:%Y%m%d%H%M%S}_${replace_slash:${model_name}}_gH${goal_H}
+    dir: ${results_root}/${env_name}/eval/${replace_slash:${ckpt_id}}/${now:%Y%m%d%H%M%S}
   sweep:
-    dir: plan_outputs/${now:%Y%m%d%H%M%S}_${replace_slash:${model_name}}_gH${goal_H}
+    dir: ${results_root}/${env_name}/eval/${replace_slash:${ckpt_id}}/${now:%Y%m%d%H%M%S}
     subdir: ${hydra.job.num}
   launcher:
     submitit_folder: ${hydra.sweep.dir}/.submitit/%j
@@ -23,8 +23,10 @@ hydra:
             "export MASTER_PORT=$(for port in $(shuf -i 30000-65500 -n 20); do if [[ $(netstat -tupln 2>&1 | grep $port | wc -l) -eq 0 ]] ; then echo $port; break; fi; done;)",]
 
 # model to load for planning
-ckpt_base_path: ./ # put absolute path here. Checkpoints will be loaded from ${ckpt_base_path}/outputs
-model_name: null
+ckpt_base_path: ./checkpoints
+results_root: ./results
+env_name: null
+ckpt_id: null
 model_epoch: latest
 
 seed: 99

@@ -8,14 +8,16 @@ defaults:
   - predictor: vit
   - override hydra/launcher: submitit_slurm
 
-# base path to save model outputs. Checkpoints will be saved to ${ckpt_base_path}/outputs.
-ckpt_base_path: ./ # put absolute path here
+# base path to save model outputs. Checkpoints are saved to ${ckpt_base_path}/${env.name}/${ckpt_id}.
+ckpt_base_path: ./checkpoints
+# human-readable label for this trained model; the checkpoint dir is named after it
+ckpt_id: ???
 
 hydra:
   run:
-    dir: ${ckpt_base_path}/outputs/${now:%Y-%m-%d}/${now:%H-%M-%S}
+    dir: ${ckpt_base_path}/${env.name}/${ckpt_id}
   sweep:
-    dir: ${ckpt_base_path}/outputs/${now:%Y-%m-%d}/${now:%H-%M-%S}
+    dir: ${ckpt_base_path}/${env.name}/${ckpt_id}
     subdir: ${hydra.job.num}
   launcher:
     submitit_folder: ${hydra.sweep.dir}/.submitit/%j

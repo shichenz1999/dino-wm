@@ -17,8 +17,9 @@ BATCHES=(
 )
 
 COMMON="--config-name plan_point_maze.yaml \
-  model_name=point_maze \
-  ckpt_base_path=/local_data/sz4968/world-model/experiments/dino-wm/checkpoints/pretrained \
+  env_name=point_maze \
+  ckpt_id=dinowm_released \
+  ckpt_base_path=/local_data/sz4968/world-model/experiments/dino-wm/checkpoints \
   n_evals=${N_EVALS} seed=${SEED} hydra/launcher=basic"
 
 ENV_SETUP="source /local_data/sz4968/miniforge3/etc/profile.d/conda.sh && \

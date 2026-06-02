@@ -33,8 +33,7 @@ class Trainer:
             cfg["saved_folder"] = os.getcwd()
             log.info(f"Model saved dir: {cfg['saved_folder']}")
         cfg_dict = cfg_to_dict(cfg)
-        model_name = cfg_dict["saved_folder"].split("outputs/")[-1]
-        model_name += f"_{self.cfg.env.name}_f{self.cfg.frameskip}_h{self.cfg.num_hist}_p{self.cfg.num_pred}"
+        model_name = f"{self.cfg.env.name}_{self.cfg.ckpt_id}_f{self.cfg.frameskip}_h{self.cfg.num_hist}_p{self.cfg.num_pred}"
 
         if HydraConfig.get().mode == RunMode.MULTIRUN:
             log.info(" Multirun setup begin...")
@@ -190,9 +189,8 @@ class Trainer:
             ckpt_path = os.path.join(os.getcwd(), f"checkpoints/model_{self.epoch}.pth")
         else:
             ckpt_path = None
-        model_name = self.cfg["saved_folder"].split("outputs/")[-1]
         model_epoch = self.epoch
-        return ckpt_path, model_name, model_epoch
+        return ckpt_path, model_epoch
 
     def load_ckpt(self, filename="model_latest.pth"):
         ckpt = torch.load(filename)
@@ -377,7 +375,7 @@ class Trainer:
             self.val()
             self.logs_flash(step=self.epoch)
             if self.epoch % self.cfg.training.save_every_x_epoch == 0:
-                ckpt_path, model_name, model_epoch = self.save_ckpt()
+                ckpt_path, model_epoch = self.save_ckpt()
                 # main thread only: launch planning jobs on the saved ckpt
                 if (
                     self.cfg.plan_settings.plan_cfg_path is not None
@@ -390,7 +388,8 @@ class Trainer:
                             self.base_path, self.cfg.plan_settings.plan_cfg_path
                         ),
                         ckpt_base_path=self.cfg.ckpt_base_path,
-                        model_name=model_name,
+                        env_name=self.cfg.env.name,
+                        ckpt_id=self.cfg.ckpt_id,
                         model_epoch=model_epoch,
                         planner=self.cfg.plan_settings.planner,
                         goal_source=self.cfg.plan_settings.goal_source,

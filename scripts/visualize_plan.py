@@ -141,12 +141,12 @@ def load_run(run_dir: Path):
 
 
 def load_train_cfg(cfg):
-    model_path = Path(str(cfg.ckpt_base_path)) / "outputs" / str(cfg.model_name)
+    model_path = Path(str(cfg.ckpt_base_path)) / str(cfg.env_name) / str(cfg.ckpt_id)
     return OmegaConf.load(model_path / "hydra.yaml")
 
 
 def load_decoder(cfg, device="cpu"):
-    model_path = Path(str(cfg.ckpt_base_path)) / "outputs" / str(cfg.model_name)
+    model_path = Path(str(cfg.ckpt_base_path)) / str(cfg.env_name) / str(cfg.ckpt_id)
     ckpt_path = model_path / "checkpoints" / f"model_{cfg.model_epoch}.pth"
     ckpt = torch.load(str(ckpt_path), map_location=device)
     decoder = ckpt["decoder"].to(device)
@@ -323,7 +323,7 @@ def cfg_to_strings(cfg):
     sub_cfg = planner_cfg.get("sub_planner", {}) if is_mpc else planner_cfg
 
     line1 = (
-        f"{cfg.get('model_name', '?')} | n_evals={cfg.get('n_evals')} | "
+        f"{cfg.get('env_name', '?')}/{cfg.get('ckpt_id', '?')} | n_evals={cfg.get('n_evals')} | "
         f"goal_source={cfg.get('goal_source')} | seed={cfg.get('seed')}"
     )
     if is_mpc:
