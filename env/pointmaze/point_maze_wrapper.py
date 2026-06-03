@@ -1,7 +1,7 @@
 import os
 import numpy as np
 import gym
-from env.pointmaze.maze_model import MazeEnv
+from env.pointmaze.maze_model import MazeEnv, WALL, COLLISION_RADIUS
 from utils import aggregate_dct
 
 STATE_RANGES = np.array([
@@ -21,22 +21,55 @@ class PointMazeWrapper(MazeEnv):
         self.action_dim = self.action_space.shape[0]
     
     def sample_random_init_goal_states(self, seed):
-        """Sample init + goal states. Maze-agnostic: picks from valid cells in
-        self.reset_locations (auto-computed from maze_arr by MazeEnv).
-        Jitter matches MazeEnv's built-in reset (±0.1) to stay clear of walls.
+        """Sample init + goal states by CONTINUOUS rejection sampling over the
+        walkable area: draw a random (x, y) in the maze's walkable bounding box
+        and keep it only if the ball (radius COLLISION_RADIUS) sits clear of
+        every WALL cell. Maze-agnostic (reads maze_arr), so init/goal can land
+        anywhere in the corridor instead of snapping to cell centres.
+
+        Cell index vs qpos: walls sit at world (w+1, h+1) and the ball body base
+        is at (1.2, 1.2), so a cell (w, h) centre is at qpos = (w, h) - OFF where
+        OFF = ball_base - 1.0 = 0.2. We must convert in BOTH directions, else the
+        sampled positions are offset ~0.2 from the real corridor (and leak into
+        walls). OFF is read from the model so it stays correct if the maze
+        construction changes.
+
+        Reproducible: a seeded RandomState drives every draw, so the same seed
+        yields the same accepted points (rejected draws advance the stream
+        deterministically too).
         """
         rs = np.random.RandomState(seed)
-        cells = self.reset_locations + self.goal_locations  # all walkable cells
+        cells = np.array(self.reset_locations + self.goal_locations)  # (K, 2) row,col
+        (rmin, cmin), (rmax, cmax) = cells.min(0), cells.max(0)
+        m = COLLISION_RADIUS                 # keep the ball's footprint clear of walls
+        arr = self.maze_arr
+        bid = self.model.body_name2id('particle')
+        off = self.model.body_pos[bid][:2] - 1.0     # qpos = cell - off  (≈0.2)
+
+        def free(x, y):
+            # ball footprint (±m) must fall in non-wall cells. qpos -> cell index
+            # is round(qpos + off).
+            for dx in (-m, m):
+                for dy in (-m, m):
+                    r = int(round(x + off[0] + dx))
+                    c = int(round(y + off[1] + dy))
+                    if not (0 <= r < arr.shape[0] and 0 <= c < arr.shape[1]):
+                        return False
+                    if arr[r, c] == WALL:
+                        return False
+            return True
 
         def generate_state():
-            w, h = cells[rs.randint(len(cells))]
-            x = w + rs.uniform(-0.1, 0.1)
-            y = h + rs.uniform(-0.1, 0.1)
-            return np.array([
-                x, y,
-                rs.uniform(STATE_RANGES[2][0], STATE_RANGES[2][1]),
-                rs.uniform(STATE_RANGES[3][0], STATE_RANGES[3][1]),
-            ])
+            while True:
+                # walkable cell range -> qpos range (cell - off), inset by m.
+                x = rs.uniform(rmin - 0.5 - off[0] + m, rmax + 0.5 - off[0] - m)
+                y = rs.uniform(cmin - 0.5 - off[1] + m, cmax + 0.5 - off[1] - m)
+                if free(x, y):
+                    return np.array([
+                        x, y,
+                        rs.uniform(STATE_RANGES[2][0], STATE_RANGES[2][1]),
+                        rs.uniform(STATE_RANGES[3][0], STATE_RANGES[3][1]),
+                    ])
 
         return generate_state(), generate_state()
     
