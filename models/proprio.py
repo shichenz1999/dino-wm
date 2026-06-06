@@ -44,7 +44,8 @@ class ProprioceptiveEmbedding(nn.Module):
         tubelet_size=1,
         in_chans=8, # action_dim
         emb_dim=384, # output_dim
-        use_3d_pos=False # always False for now
+        use_3d_pos=False, # always False for now
+        use_layernorm=True,
     ):
         super().__init__()
         print(f'using 3d prop position {use_3d_pos=}')
@@ -60,10 +61,12 @@ class ProprioceptiveEmbedding(nn.Module):
             emb_dim,
             kernel_size=tubelet_size,
             stride=tubelet_size)
+        self.norm = nn.LayerNorm(emb_dim) if use_layernorm else nn.Identity()
 
     def forward(self, x):
         # x: proprioceptive vectors of shape [B T D]
         x = x.permute(0, 2, 1)
         x = self.patch_embed(x)
         x = x.permute(0, 2, 1)
+        x = self.norm(x) if hasattr(self, 'norm') else x
         return x

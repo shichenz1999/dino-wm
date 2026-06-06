@@ -163,6 +163,35 @@ class Decoder(nn.Module):
         return self.blocks(input)
 
 
+class ProjectorDecoder(nn.Module):
+    def __init__(self, projector_cfg):
+        super().__init__()
+        conv_layers = projector_cfg.conv_layers
+        conv_layers = list(reversed(conv_layers))
+        self.deconv_layers = nn.ModuleList()
+
+        for cfg in conv_layers:
+            self.deconv_layers.append(
+                nn.ConvTranspose2d(
+                    in_channels=cfg.out_dim,
+                    out_channels=cfg.in_dim,
+                    kernel_size=cfg.kernel_size,
+                    stride=cfg.stride,
+                    padding=cfg.padding,
+                    output_padding=getattr(cfg, "output_padding", 0),
+                )
+            )
+
+        self.activation = nn.ReLU(inplace=True)
+
+    def forward(self, x):
+        for i, deconv in enumerate(self.deconv_layers):
+            x = deconv(x)
+            if i != len(self.deconv_layers) - 1:
+                x = self.activation(x)
+        return x
+
+
 class VQVAE(nn.Module):
     def __init__(
         self,
@@ -174,19 +203,28 @@ class VQVAE(nn.Module):
         n_embed=512,
         decay=0.99,
         quantize=True,
+        projector_cfg=None,
     ):
         super().__init__()
 
         self.quantize = quantize
         self.quantize_b = Quantize(emb_dim, n_embed)
+        self.projector_cfg = projector_cfg
+        self.proj_decoder = None
 
         if not quantize:
             for param in self.quantize_b.parameters():
                 param.requires_grad = False
 
-        self.upsample_b = Decoder(emb_dim, emb_dim, channel, n_res_block, n_res_channel, stride=4)
+        decoder_emb_dim = emb_dim
+        if projector_cfg is not None:
+            first = projector_cfg.conv_layers[0]
+            decoder_emb_dim = first.in_dim
+            self.proj_decoder = ProjectorDecoder(projector_cfg=projector_cfg)
+
+        self.upsample_b = Decoder(decoder_emb_dim, decoder_emb_dim, channel, n_res_block, n_res_channel, stride=4)
         self.dec = Decoder(
-            emb_dim,
+            decoder_emb_dim,
             in_channel,
             channel,
             n_res_block,
@@ -214,6 +252,12 @@ class VQVAE(nn.Module):
         return dec, diff_b # diff is 0 if no quantization
 
     def decode(self, quant_b):
+        # Older serialized checkpoints may not have this attribute.
+        proj_decoder = getattr(self, "proj_decoder", None)
+        if proj_decoder is not None:
+            quant_b = proj_decoder(quant_b)
+        if quant_b.shape[-2:] != (14, 14):
+            quant_b = F.interpolate(quant_b, size=(14, 14), mode="bilinear", align_corners=False)
         upsample_b = self.upsample_b(quant_b) 
         dec = self.dec(upsample_b) # quant: (128, 64, 64)
         return dec

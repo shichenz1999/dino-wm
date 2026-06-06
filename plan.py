@@ -650,6 +650,8 @@ def load_ckpt(snapshot_path, device):
 
 
 def load_model(model_ckpt, train_cfg, num_action_repeat, device):
+    # Prime dinov2 hub module so torch.load can unpickle encoder objects
+    torch.hub.load("facebookresearch/dinov2", train_cfg.encoder.name)
     result = {}
     if model_ckpt.exists():
         result = load_ckpt(model_ckpt, device)

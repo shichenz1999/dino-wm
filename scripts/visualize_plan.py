@@ -147,6 +147,8 @@ def load_train_cfg(cfg):
 
 def load_decoder(cfg, device="cpu"):
     model_path = Path(str(cfg.ckpt_base_path)) / str(cfg.env_name) / str(cfg.ckpt_id)
+    train_cfg = OmegaConf.load(model_path / "hydra.yaml")
+    torch.hub.load("facebookresearch/dinov2", train_cfg.encoder.name)
     ckpt_path = model_path / "checkpoints" / f"model_{cfg.model_epoch}.pth"
     ckpt = torch.load(str(ckpt_path), map_location=device)
     decoder = ckpt["decoder"].to(device)

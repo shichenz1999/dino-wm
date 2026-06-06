@@ -91,11 +91,24 @@ class TrajSlicerDataset(TrajDataset):
 
     def __getitem__(self, idx):
         i, start, end = self.slices[idx]
-        obs, act, state, _ = self.dataset[i]
-        for k, v in obs.items():
-            obs[k] = v[start:end:self.frameskip]
-        state = state[start:end:self.frameskip]
-        act = act[start:end]
+        if hasattr(self.dataset, "load_visual_frames"):
+            frame_idx = list(range(start, end, self.frameskip))
+            visual = self.dataset.load_visual_frames(i, frame_idx)
+            proprio = self.dataset.proprios[i, frame_idx]
+            obs = {"visual": visual, "proprio": proprio}
+            state = self.dataset.states[i, frame_idx]
+            act = self.dataset.actions[i, start:end]
+        elif hasattr(self.dataset, "get_frames"):
+            obs, act, state, _ = self.dataset.get_frames(i, range(start, end))
+            for k, v in obs.items():
+                obs[k] = v[:: self.frameskip]
+            state = state[:: self.frameskip]
+        else:
+            obs, act, state, _ = self.dataset[i]
+            for k, v in obs.items():
+                obs[k] = v[start:end:self.frameskip]
+            state = state[start:end:self.frameskip]
+            act = act[start:end]
         act = rearrange(act, "(n f) d -> n (f d)", n=self.num_frames)  # concat actions
         return tuple([obs, act, state])
 

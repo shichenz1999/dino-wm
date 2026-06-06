@@ -56,10 +56,10 @@ planner:
   sub_planner:
     target: planning.cem.CEMPlanner
     horizon: 5
-    topk: 10
-    num_samples: 100
+    topk: 30
+    num_samples: 300
     var_scale: 1
-    opt_steps: 10
+    opt_steps: 30
     eval_every: 1
   name: mpc_cem
 

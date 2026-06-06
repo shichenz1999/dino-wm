@@ -3,10 +3,8 @@ import decord
 import numpy as np
 from pathlib import Path
 from einops import rearrange
-from decord import VideoReader
 from typing import Callable, Optional
 from .traj_dset import TrajDataset, get_train_val_sliced
-from typing import Optional, Callable, Any
 decord.bridge.set_bridge("torch")
 
 class PointMazeDataset(TrajDataset):
@@ -17,10 +15,15 @@ class PointMazeDataset(TrajDataset):
         transform: Optional[Callable] = None,
         normalize_action: bool = False,
         action_scale=1.0,
+        use_preprocessed: bool = False,
+        use_frame_files: bool = False,
     ):
         self.data_path = Path(data_path)
         self.transform = transform
         self.normalize_action = normalize_action
+        self.use_preprocessed = use_preprocessed
+        self.use_frame_files = use_frame_files
+
         states = torch.load(self.data_path / "states.pth").float()
         self.states = states
         self.actions = torch.load(self.data_path / "actions.pth").float()
@@ -80,19 +83,12 @@ class PointMazeDataset(TrajDataset):
         return torch.cat(result, dim=0)
 
     def get_frames(self, idx, frames):
-        obs_dir = self.data_path / "obses"
-        image = torch.load(obs_dir / f"episode_{idx:03d}.pth")
+        visual = self.load_visual_frames(idx, frames)
         proprio = self.proprios[idx, frames]
         act = self.actions[idx, frames]
         state = self.states[idx, frames]
-
-        image = image[frames]  # THWC
-        image = image / 255.0
-        image = rearrange(image, "T H W C -> T C H W")
-        if self.transform:
-            image = self.transform(image)
         obs = {
-            "visual": image,
+            "visual": visual,
             "proprio": proprio
         }
         return obs, act, state, {} # env_info
@@ -108,6 +104,52 @@ class PointMazeDataset(TrajDataset):
             raise NotImplementedError
         elif isinstance(imgs, torch.Tensor):
             return rearrange(imgs, "b h w c -> b c h w") / 255.0
+
+    def load_visual_frames(self, episode_idx: int, frame_indices):
+        """Load only requested visual frames for one episode."""
+        if isinstance(frame_indices, range):
+            frame_indices = list(frame_indices)
+        elif isinstance(frame_indices, torch.Tensor):
+            frame_indices = frame_indices.tolist()
+        else:
+            frame_indices = list(frame_indices)
+
+        if self.use_frame_files:
+            raw_visual = self._load_frames_from_frame_files(episode_idx, frame_indices)
+        else:
+            episode_visual = self._load_episode_visual_tensor(episode_idx)
+            raw_visual = episode_visual[frame_indices]
+
+        if self.use_preprocessed:
+            return raw_visual
+
+        visual = raw_visual / 255.0
+        visual = rearrange(visual, "T H W C -> T C H W")
+        if self.transform:
+            visual = self.transform(visual)
+        return visual
+
+    def _load_episode_visual_tensor(self, idx):
+        """Load one full episode tensor from `obses/episode_xxx.pth`."""
+        obs_dir = self.data_path / "obses"
+        image_path = obs_dir / f"episode_{idx:03d}.pth"
+        if not image_path.exists():
+            raise ValueError(f"Failed to load image for episode {idx}")
+        return torch.load(image_path, map_location="cpu")
+
+    def _load_frames_from_frame_files(self, episode_idx: int, frame_indices):
+        """Load raw frame tensors from individual frame files."""
+        frames = []
+        frame_dir = self.data_path / "obses"
+        for frame_idx in frame_indices:
+            frame_path = frame_dir / f"episode_{episode_idx:03d}_frame_{frame_idx:03d}.pth"
+            if not frame_path.exists():
+                raise ValueError(
+                    f"Failed to load frame {frame_idx} for episode {episode_idx}"
+                )
+            frame = torch.load(frame_path, map_location="cpu")
+            frames.append(frame)
+        return torch.stack(frames, dim=0)
         
 def load_point_maze_slice_train_val(
     transform,
@@ -118,12 +160,16 @@ def load_point_maze_slice_train_val(
     num_hist=0,
     num_pred=0,
     frameskip=0,
+    use_preprocessed=False,
+    use_frame_files=False,
 ):
     dset = PointMazeDataset(
         n_rollout=n_rollout,
         transform=transform,
         data_path=data_path,
         normalize_action=normalize_action,
+        use_preprocessed=use_preprocessed,
+        use_frame_files=use_frame_files,
     )
     dset_train, dset_val, train_slices, val_slices = get_train_val_sliced(
         traj_dataset=dset, 
