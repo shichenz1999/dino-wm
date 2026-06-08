@@ -14,7 +14,7 @@ RESULTS=/local_data/sz4968/world-model/experiments/dino-wm/results
 LOGDIR=$RESULTS/logs
 EVAL=$RESULTS/point_maze/eval
 mkdir -p "$LOGDIR"
-MAX_RETRY=5
+MAX_RETRY=10
 MIN_FREE_MIB=19000   # only start a job on a GPU with at least this much free VRAM
 
 # Block until the given physical GPU has >= MIN_FREE_MIB free (avoids the
