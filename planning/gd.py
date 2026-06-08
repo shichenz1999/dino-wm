@@ -98,6 +98,8 @@ class GDPlanner(BasePlanner):
             loss = self.objective_fn(i_z_obses, z_obs_g_detached)  # (n_evals, )
             total_loss = loss.mean() * n_evals  # loss for each eval is independent
             total_loss.backward()
+            if self.tracer is not None:  # record iterate + per-eval loss + grad
+                self.tracer.add_gd(i, actions, loss, actions.grad)
             with torch.no_grad():
                 actions_new = actions - optimizer.param_groups[0]["lr"] * actions.grad
                 actions_new += (

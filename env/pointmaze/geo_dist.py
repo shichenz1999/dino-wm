@@ -6,12 +6,16 @@ from functools import lru_cache
 from typing import Tuple
 import numpy as np
 
-from .maze_model import parse_maze, WALL, COLLISION_RADIUS
+from .maze_model import parse_maze, WALL, COLLISION_RADIUS, wall_boxes, clearance_to_walls
 
 Cell = Tuple[int, int]
 
 # Geodesic-field grid spacing (qpos units); smaller = more accurate but slower.
 RESOLUTION = 0.02
+
+# qpos -> cell-space shift: cell_space = qpos + 0.2 (particle body base at 1.2,
+# walls at w+1). Both goal and ball qpos add this before indexing the grid.
+QPOS_CELL_OFFSET = 0.2
 
 
 @dataclass
@@ -25,8 +29,8 @@ class GeoField:
 
     def distance(self, qpos) -> float:
         """Geodesic distance from goal to a continuous ball position."""
-        i = int(round((float(qpos[0]) - self.x0) / self.res))
-        j = int(round((float(qpos[1]) - self.y0) / self.res))
+        i = int(round((float(qpos[0]) + QPOS_CELL_OFFSET - self.x0) / self.res))
+        j = int(round((float(qpos[1]) + QPOS_CELL_OFFSET - self.y0) / self.res))
         i = min(max(i, 0), self.phi.shape[0] - 1)
         j = min(max(j, 0), self.phi.shape[1] - 1)
         d = self.phi[i, j]
@@ -53,13 +57,13 @@ def geo_field(maze_spec: str, goal_pix: Cell,
 
     xs = x0 + res * np.arange(nx)
     ys = y0 + res * np.arange(ny)
-    cw = np.clip(np.floor(xs + 0.5).astype(int), 0, width - 1)
-    ch = np.clip(np.floor(ys + 0.5).astype(int), 0, height - 1)
-    open_mask = (maze_arr != WALL)[cw[:, None], ch[None, :]]
 
-    # Erode free space by the ball radius -> where the ball CENTER may sit.
-    edt = distance_transform_edt(open_mask) * res  # dist to nearest wall pixel
-    center_free = edt >= ball_radius
+    # Where the ball CENTRE may sit: exact disk-vs-wall clearance (grid in cell
+    # space, so offset 0), shared with the goal sampler. Subsumes the old
+    # open_mask + pixel-EDT erosion in one step (wall-interior clearance is 0).
+    boxes = wall_boxes(maze_arr, offset=0.0)
+    pts = np.stack(np.meshgrid(xs, ys, indexing="ij"), axis=-1)  # (nx, ny, 2)
+    center_free = clearance_to_walls(pts, boxes) >= ball_radius - 1e-9  # eps: boundary at ==r
 
     # Goal must sit in the ball-center free space (a goal too close to a wall
     # is a bug -> fail loudly, don't silently fix).
@@ -88,8 +92,8 @@ def field_for(maze_spec: str, goal_qpos: np.ndarray,
     """Goal qpos -> cached geodesic field, seeded at the goal's true grid pixel
     (no goal-noise assumption)."""
     res = float(resolution)
-    gi = int(round((float(goal_qpos[0]) + 0.5) / res))
-    gj = int(round((float(goal_qpos[1]) + 0.5) / res))
+    gi = int(round((float(goal_qpos[0]) + QPOS_CELL_OFFSET + 0.5) / res))
+    gj = int(round((float(goal_qpos[1]) + QPOS_CELL_OFFSET + 0.5) / res))
     return geo_field(maze_spec, (gi, gj), ball_radius, resolution)
 
 

@@ -776,7 +776,7 @@ def render_summary(run_dir, cfg, meta, out_path,
 # Main
 # ---------------------------------------------------------------------------
 
-def main(run_dir: str, per_iter: bool = False):
+def main(run_dir: str, per_iter: bool = True):
     run_dir = Path(run_dir).resolve()
     if not run_dir.exists():
         raise FileNotFoundError(f"Run dir not found: {run_dir}")
@@ -959,7 +959,8 @@ if __name__ == "__main__":
     parser.add_argument(
         "--per-iter",
         action="store_true",
-        help="Also generate cumulative per-iter snapshots.",
+        default=True,
+        help="Generate cumulative per-iter snapshots (on by default).",
     )
     args = parser.parse_args()
     main(args.run_dir, per_iter=args.per_iter)

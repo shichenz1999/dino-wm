@@ -1,7 +1,9 @@
 import os
 import numpy as np
 import gym
-from env.pointmaze.maze_model import MazeEnv, WALL, COLLISION_RADIUS
+from env.pointmaze.maze_model import (
+    MazeEnv, WALL, COLLISION_RADIUS, wall_boxes, clearance_to_walls,
+)
 from utils import aggregate_dct
 
 STATE_RANGES = np.array([
@@ -46,18 +48,12 @@ class PointMazeWrapper(MazeEnv):
         bid = self.model.body_name2id('particle')
         off = self.model.body_pos[bid][:2] - 1.0     # qpos = cell - off  (≈0.2)
 
+        # Exact disk-vs-wall clearance in the qpos frame, shared with the
+        # geodesic erosion (clearance_to_walls). off is symmetric (0.2, 0.2).
+        boxes = wall_boxes(arr, offset=off[0])
+
         def free(x, y):
-            # ball footprint (±m) must fall in non-wall cells. qpos -> cell index
-            # is round(qpos + off).
-            for dx in (-m, m):
-                for dy in (-m, m):
-                    r = int(round(x + off[0] + dx))
-                    c = int(round(y + off[1] + dy))
-                    if not (0 <= r < arr.shape[0] and 0 <= c < arr.shape[1]):
-                        return False
-                    if arr[r, c] == WALL:
-                        return False
-            return True
+            return clearance_to_walls((x, y), boxes) >= m - 1e-9  # eps: boundary at ==m
 
         def generate_state():
             while True:

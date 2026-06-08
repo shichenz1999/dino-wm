@@ -116,6 +116,9 @@ class CEMPlanner(BasePlanner):
                 losses.append(loss[topk_idx[0]].item())
                 mu[traj] = topk_action.mean(dim=0)
                 sigma[traj] = topk_action.std(dim=0)
+                if self.tracer is not None:  # record full population + updated dist
+                    self.tracer.add_cem(i, traj, action, loss, topk_idx,
+                                        mu[traj], sigma[traj])
 
             self.wandb_run.log(
                 {f"{self.logging_prefix}/loss": np.mean(losses), "step": i + 1}

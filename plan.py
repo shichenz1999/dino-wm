@@ -214,6 +214,19 @@ class PlanWorkspace:
         else:
             self.planner.horizon = cfg_dict["goal_H"]
 
+        # optional planner-search trace (off unless trace.enabled). Shared by the
+        # MPC wrapper and its sub_planner so both round and opt-step hooks fire.
+        self.tracer = None
+        trace_cfg = cfg_dict.get("trace") or {}
+        if trace_cfg.get("enabled", False):
+            from planning.tracer import PlanTracer
+            sub = self.planner.sub_planner if isinstance(self.planner, MPCPlanner) else self.planner
+            self.tracer = PlanTracer(planner=sub.__class__.__name__.replace("Planner", "").lower(),
+                                     dtype=trace_cfg.get("dtype", "float16"))
+            self.planner.tracer = self.tracer
+            if isinstance(self.planner, MPCPlanner):
+                self.planner.sub_planner.tracer = self.tracer
+
     # ---- targets: pick init + goal conditions ----
 
     def prepare_targets(self):
@@ -597,6 +610,31 @@ class PlanWorkspace:
                 f,
             )
         print(f"Dumped plan meta to {os.path.abspath('plan_meta.pkl')}")
+
+        # plan_trace.pkl: planner inner search (only if tracing was enabled)
+        if getattr(self, "tracer", None) is not None:
+            sub = self.planner.sub_planner if hasattr(self.planner, "sub_planner") else self.planner
+            self.tracer.dump(
+                "plan_trace.pkl",
+                config={
+                    "num_samples": getattr(sub, "num_samples", None),
+                    "topk": getattr(sub, "topk", None),
+                    "opt_steps": getattr(sub, "opt_steps", None),
+                    "horizon": getattr(sub, "horizon", None),
+                    "action_dim": self.action_dim,
+                    "max_iter": getattr(self.planner, "max_iter", None),
+                    "n_taken_actions": getattr(self.planner, "n_taken_actions", None),
+                    "frameskip": self.frameskip,
+                },
+                meta={
+                    "state_0": self.state_0, "state_g": self.state_g,
+                    "e_states": e_states, "successes": np.asarray(successes),
+                    "action_len": action_len, "seed": self.cfg_dict["seed"],
+                    "setting": self.cfg_dict.get("setting"),
+                    "env_name": self.env_name,
+                },
+            )
+            print(f"Dumped plan trace to {os.path.abspath('plan_trace.pkl')}")
 
         # plan_latents.pkl: WM rollout latents (for visualization)
         self._generate_wm_latents(actions, e_obses)

@@ -37,6 +37,13 @@ n_plot_samples: 10
 
 debug_dset_init: False
 
+# Planner-search trace: when enabled, record the full CEM population (or GD
+# iterate) at every opt step + round to plan_trace.pkl, for visualizing how the
+# search converges. enabled=false runs byte-identically (no recording).
+trace:
+  enabled: false
+  dtype: float16
+
 objective:
   _target_: planning.objectives.create_objective_fn
   alpha: 0
@@ -51,7 +58,7 @@ success:
 
 planner:
   _target_: planning.mpc.MPCPlanner
-  max_iter: 10
+  max_iter: 5
   n_taken_actions: 5
   sub_planner:
     target: planning.cem.CEMPlanner
@@ -59,7 +66,7 @@ planner:
     topk: 30
     num_samples: 300
     var_scale: 1
-    opt_steps: 30
+    opt_steps: 10
     eval_every: 1
   name: mpc_cem
 

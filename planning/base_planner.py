@@ -24,6 +24,7 @@ class BasePlanner(ABC):
         self.evaluator = evaluator
         self.wandb_run = wandb_run
         self.log_filename = log_filename  # do not log if None
+        self.tracer = None  # optional PlanTracer; when None the planner runs unchanged
 
     def dump_logs(self, logs):
         logs_entry = {

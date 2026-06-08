@@ -84,6 +84,8 @@ class MPCPlanner(BasePlanner):
         memo_actions = None
         while not np.all(self.is_success) and self.iter < self.max_iter:
             self.sub_planner.logging_prefix = f"plan_{self.iter}"
+            if self.tracer is not None:
+                self.tracer.start_round(self.iter)
             actions, _ = self.sub_planner.plan(
                 obs_0=cur_obs_0,
                 obs_g=obs_g,
@@ -93,6 +95,8 @@ class MPCPlanner(BasePlanner):
             self._apply_success_mask(taken_actions)
             memo_actions = actions.detach()[:, self.n_taken_actions :]
             self.planned_actions.append(taken_actions)
+            if self.tracer is not None:  # chosen action seq + executed prefix
+                self.tracer.record_chosen(actions.detach(), taken_actions)
 
             print(f"MPC iter {self.iter} Eval ------- ")
             action_so_far = torch.cat(self.planned_actions, dim=1)

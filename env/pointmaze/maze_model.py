@@ -33,6 +33,29 @@ def parse_maze(maze_str):
     return maze_arr
 
 
+def wall_boxes(maze_arr, offset=0.0):
+    """Wall rectangles as (M, 4) [x0,x1,y0,y1]. Cell (r,c) spans
+    [r-0.5, r+0.5]^2 in cell space; `offset` shifts to the ball qpos frame."""
+    walls = np.argwhere(maze_arr == WALL).astype(float)
+    x0 = walls[:, 0] - offset - 0.5
+    x1 = walls[:, 0] - offset + 0.5
+    y0 = walls[:, 1] - offset - 0.5
+    y1 = walls[:, 1] - offset + 0.5
+    return np.stack([x0, x1, y0, y1], axis=1)
+
+
+def clearance_to_walls(points, boxes):
+    """Exact min distance from each point to the nearest wall rectangle
+    (true-circle, grid-independent). Shared by the goal sampler and the
+    geodesic erosion. points: (...,2); boxes: (M,4) from wall_boxes."""
+    pts = np.asarray(points, dtype=float)
+    flat = pts.reshape(-1, 2)
+    px = flat[:, 0:1]; py = flat[:, 1:2]
+    dx = np.maximum(np.maximum(boxes[:, 0][None, :] - px, px - boxes[:, 1][None, :]), 0.0)
+    dy = np.maximum(np.maximum(boxes[:, 2][None, :] - py, py - boxes[:, 3][None, :]), 0.0)
+    return np.sqrt(dx * dx + dy * dy).min(axis=1).reshape(pts.shape[:-1])
+
+
 def point_maze(maze_str,
                ball_rgba='0.3 0.6 0.3 1',
                wall_rgba='.7 .5 .3 1',
