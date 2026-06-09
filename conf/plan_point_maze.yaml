@@ -37,11 +37,11 @@ n_plot_samples: 10
 
 debug_dset_init: False
 
-# Planner-search trace: when enabled, record the full CEM population (or GD
-# iterate) at every opt step + round to plan_trace.pkl, for visualizing how the
-# search converges. enabled=false runs byte-identically (no recording).
+# Planner-search trace: records the full CEM population (or GD iterate) at every
+# opt step + round to plan_trace.pkl, for visualizing how the search converges.
+# On by default; set enabled=false to skip (then planner runs byte-identically).
 trace:
-  enabled: false
+  enabled: true
   dtype: float16
 
 objective:
