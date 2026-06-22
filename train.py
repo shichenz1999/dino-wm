@@ -166,9 +166,12 @@ class Trainer:
             ["decoder", "decoder_optimizer"] if self.train_decoder else []
         )
         self._keys_to_save += ["action_encoder", "proprio_encoder"]
+        if self.cfg.has_predictor:
+            self._keys_to_save += ["action_encoder_optimizer"]
 
         self.init_models()
         self.init_optimizers()
+        self.maybe_resume()
 
         self.epoch_log = OrderedDict()
 
@@ -192,20 +195,27 @@ class Trainer:
         model_epoch = self.epoch
         return ckpt_path, model_epoch
 
-    def load_ckpt(self, filename="model_latest.pth"):
-        ckpt = torch.load(filename)
-        for k, v in ckpt.items():
-            self.__dict__[k] = v
-        not_in_ckpt = set(self._keys_to_save) - set(ckpt.keys())
-        if len(not_in_ckpt):
-            log.warning("Keys not found in ckpt: %s", not_in_ckpt)
+    def maybe_resume(self, filename="model_latest.pth"):
+        # Resume by loading state_dicts into the already-instantiated, on-device,
+        # accelerator-prepared models/optimizers. (Loading whole pickled objects
+        # mis-placed tensors across GPUs under DDP; load_state_dict respects device.)
+        ckpt_path = Path(self.cfg.saved_folder) / "checkpoints" / filename
+        if not ckpt_path.exists():
+            return
+        ckpt = torch.load(ckpt_path, map_location=self.device)
+        for k in self._keys_to_save:
+            if k == "epoch":
+                self.epoch = ckpt["epoch"]
+                continue
+            if k not in ckpt:
+                log.warning("Resume: key %s not in checkpoint, skipping", k)
+                continue
+            obj = self.__dict__[k]
+            target = self.accelerator.unwrap_model(obj) if hasattr(obj, "module") else obj
+            target.load_state_dict(ckpt[k].state_dict())
+        log.info(f"Resumed from epoch {self.epoch}: {ckpt_path}")
 
     def init_models(self):
-        model_ckpt = Path(self.cfg.saved_folder) / "checkpoints" / "model_latest.pth"
-        if model_ckpt.exists():
-            self.load_ckpt(model_ckpt)
-            log.info(f"Resuming from epoch {self.epoch}: {model_ckpt}")
-
         # initialize encoder
         if self.encoder is None:
             self.encoder = hydra.utils.instantiate(
