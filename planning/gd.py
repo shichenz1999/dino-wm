@@ -22,6 +22,10 @@ class GDPlanner(BasePlanner):
         wandb_run,
         logging_prefix="plan_0",
         log_filename="logs.json",
+        optimizer="sgd",                 # sgd (default, = original behavior) | adam | adamw
+        use_cosine_scheduler=False,
+        scheduler_eta_min=0.0,
+        adamw_weight_decay=0.01,
         **kwargs,
     ):
         super().__init__(
@@ -40,6 +44,10 @@ class GDPlanner(BasePlanner):
         self.opt_steps = opt_steps
         self.eval_every = eval_every
         self.logging_prefix = logging_prefix
+        self.optimizer_name = str(optimizer).lower()
+        self.use_cosine_scheduler = use_cosine_scheduler
+        self.scheduler_eta_min = scheduler_eta_min
+        self.adamw_weight_decay = adamw_weight_decay
 
     def init_actions(self, obs_0, actions=None):
         """
@@ -66,7 +74,20 @@ class GDPlanner(BasePlanner):
         return actions
 
     def get_action_optimizer(self, actions):
-        return torch.optim.SGD([actions], lr=self.lr)
+        if self.optimizer_name == "sgd":
+            return torch.optim.SGD([actions], lr=self.lr)
+        if self.optimizer_name == "adam":
+            return torch.optim.Adam([actions], lr=self.lr)
+        if self.optimizer_name == "adamw":
+            return torch.optim.AdamW([actions], lr=self.lr, weight_decay=self.adamw_weight_decay)
+        raise ValueError(f"Invalid optimizer: {self.optimizer_name}. Expected sgd|adam|adamw.")
+
+    def get_scheduler(self, optimizer):
+        if self.use_cosine_scheduler:
+            return torch.optim.lr_scheduler.CosineAnnealingLR(
+                optimizer, T_max=self.opt_steps, eta_min=self.scheduler_eta_min
+            )
+        return None
 
     def plan(self, obs_0, obs_g, actions=None):
         """
@@ -87,6 +108,7 @@ class GDPlanner(BasePlanner):
         actions = self.init_actions(obs_0, actions).to(self.device)
         actions.requires_grad = True
         optimizer = self.get_action_optimizer(actions)
+        scheduler = self.get_scheduler(optimizer)
         n_evals = actions.shape[0]
 
         for i in range(self.opt_steps):
@@ -98,14 +120,13 @@ class GDPlanner(BasePlanner):
             loss = self.objective_fn(i_z_obses, z_obs_g_detached)  # (n_evals, )
             total_loss = loss.mean() * n_evals  # loss for each eval is independent
             total_loss.backward()
-            if self.tracer is not None:  # record iterate + per-eval loss + grad
+            if self.tracer is not None:  # record iterate + per-eval loss + grad (pre-step)
                 self.tracer.add_gd(i, actions, loss, actions.grad)
+            optimizer.step()                      # SGD: == old manual update; Adam/AdamW: adaptive
+            if scheduler is not None:
+                scheduler.step()
             with torch.no_grad():
-                actions_new = actions - optimizer.param_groups[0]["lr"] * actions.grad
-                actions_new += (
-                    torch.randn_like(actions_new) * self.action_noise
-                )  # Add Gaussian noise
-                actions.copy_(actions_new)
+                actions += torch.randn_like(actions) * self.action_noise  # Add Gaussian noise
 
             self.wandb_run.log(
                 {f"{self.logging_prefix}/loss": total_loss.item(), "step": i + 1}
