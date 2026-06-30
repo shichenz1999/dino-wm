@@ -1,6 +1,7 @@
 defaults:
   - _self_
   - task: baseline       # task=avoid_goal bundles variant/objective.invert/success.mode
+  - planner: mpc_cem     # planner is a config GROUP -> `planner=gd` REPLACES it (no merge leftover)
   # - override hydra/launcher: submitit_slurm
 
 hydra:
@@ -56,19 +57,8 @@ objective:
 success:
   mode: default
 
-planner:
-  _target_: planning.mpc.MPCPlanner
-  max_iter: 5
-  n_taken_actions: 5
-  sub_planner:
-    target: planning.cem.CEMPlanner
-    horizon: 5
-    topk: 30
-    num_samples: 300
-    var_scale: 1
-    opt_steps: 10
-    eval_every: 1
-  name: mpc_cem
+# Planner now comes from the `planner` config group (defaults: planner=mpc_cem).
+# Select another at CLI: `planner=gd` / `planner=mpc_gd` / `planner=cem` -> full replace.
 
 # Maze layout. Override at CLI: `python plan.py setting=medium`.
 setting: u_maze
@@ -104,3 +94,14 @@ env_id_map:
     baseline: maze2d-small-v0
   open:
     baseline: maze2d-open-v0
+  # 5x5 held-out unseen test mazes (diversity/quantity pool); see env/pointmaze/mazes_5x5.py
+  cornermaze:
+    baseline: maze2d-5x5-cornermaze-v0
+  jmaze:
+    baseline: maze2d-5x5-jmaze-v0
+  pmaze:
+    baseline: maze2d-5x5-pmaze-v0
+  rzmaze:
+    baseline: maze2d-5x5-rzmaze-v0
+  vmaze:
+    baseline: maze2d-5x5-vmaze-v0

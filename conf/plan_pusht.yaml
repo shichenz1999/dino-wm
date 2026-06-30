@@ -1,5 +1,6 @@
 defaults:
   - _self_
+  - planner: mpc_cem     # planner config GROUP -> `planner=gd` REPLACES (no merge leftover)
   - override hydra/launcher: submitit_slurm
 
 hydra:
@@ -42,17 +43,4 @@ objective:
   base: 2
   mode: last
 
-planner:
-  _target_: planning.mpc.MPCPlanner
-  max_iter: null 
-  n_taken_actions: 5
-  sub_planner:
-    target: planning.cem.CEMPlanner
-    horizon: 5
-    topk: 30
-    num_samples: 300
-    var_scale: 1
-    opt_steps: 30
-    eval_every: 1
-  name: mpc_cem
 

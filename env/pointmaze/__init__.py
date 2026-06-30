@@ -306,4 +306,5 @@ register(
 
 from . import color_variants  # noqa: F401  (registers color generalization variants)
 from . import task_variants   # noqa: F401  (registers task-flip variants)
+from . import mazes_5x5       # noqa: F401  (registers the 23 maze2d-5x5-* diversity/quantity pool mazes)
 

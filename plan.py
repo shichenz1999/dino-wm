@@ -210,7 +210,7 @@ class PlanWorkspace:
         from planning.mpc import MPCPlanner
         if isinstance(self.planner, MPCPlanner):
             self.planner.sub_planner.horizon = cfg_dict["goal_H"]
-            self.planner.n_taken_actions = cfg_dict["goal_H"]
+            # self.planner.n_taken_actions = cfg_dict["goal_H"]
         else:
             self.planner.horizon = cfg_dict["goal_H"]
 
@@ -364,18 +364,10 @@ class PlanWorkspace:
         return far, ok
 
     def _maze_spec(self):
-        """Maze spec string for the current `setting` (default U_MAZE)."""
-        from env.pointmaze.maze_model import (
-            U_MAZE, U_MAZE_EVAL, MEDIUM_MAZE, MEDIUM_MAZE_EVAL,
-            LARGE_MAZE, LARGE_MAZE_EVAL, SMALL_MAZE, OPEN,
-        )
-        spec_map = {
-            "u_maze": U_MAZE, "u_maze_eval": U_MAZE_EVAL,
-            "medium": MEDIUM_MAZE, "medium_eval": MEDIUM_MAZE_EVAL,
-            "large":  LARGE_MAZE,  "large_eval":  LARGE_MAZE_EVAL,
-            "small":  SMALL_MAZE,  "open":        OPEN,
-        }
-        return spec_map.get(self.cfg_dict.get("setting", ""), U_MAZE)
+        """Maze layout of the current setting, from its gym registration (single source)."""
+        import gym
+        env_id = self.cfg_dict["env_id_map"][self.cfg_dict["setting"]]["baseline"]
+        return gym.spec(env_id).kwargs["maze_spec"]
 
     # ---- WM latent rollout (for visualization) ----
 
